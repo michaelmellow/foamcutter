@@ -15,6 +15,11 @@ dev = [
     "ruff",
     "mypy",
 ]
+# Third-party libraries for each package. tests/step/ is skipped when any
+# library in the step group is not installed.
+cam = []
+step = []
+sim = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -30,6 +35,8 @@ extend-exclude = ["output"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
+# Only the packages are checked, not tests/.
+# temporary: remove when the first tests exist
 packages = ["foamcam", "foamstep", "foamsim"]
 strict = true
 

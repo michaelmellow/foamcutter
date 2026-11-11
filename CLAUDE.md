@@ -40,7 +40,11 @@ RULES FOR THIS SESSION
 - Work on the branch your prompt names. Never commit to `main`.
 - Write only in the folders your prompt names.
 - Do not edit anything in `docs/briefs/`. Do not edit `docs/formats/` after it has been approved; ask first.
-- `python check.py` must pass before you report.
+- `python check.py <your area>` must pass before you report. The firmware brief has no area.
 - Do not weaken or delete a test to make it pass. If a test is wrong, stop and explain.
 - Generated files go in `output/`.
 - Finish by writing `docs/reports/brief-N-report.md`: what was built, what was verified and how, what was not verified, open questions.
+- Sessions never merge. The user merges a brief's branch into main after the project director has reviewed its report.
+- There is no Brief 2. It was removed from the plan; the briefs are numbered 1, 3, 4 and 5.
+- Third-party Python libraries are allowed where they are needed (for example numpy, a YAML parser, a plotting library, an OpenCascade binding). Declare them in your package's dependency group.
+- The firmware binary is committed to `firmware/release/`, with the grblHAL commit hash in its file name.

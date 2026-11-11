@@ -1,28 +1,56 @@
 """Run lint, type check and tests. Exits non-zero if any of them fails.
 
-Usage: python check.py
+Usage:
+    python check.py          check everything
+    python check.py AREA     check one area only: cam, step or sim
 """
 
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+AREAS = {
+    "cam": ("foamcam", "tests/cam"),
+    "step": ("foamstep", "tests/step"),
+    "sim": ("foamsim", "tests/sim"),
+}
+
 # pytest exit code 5 means "no tests collected"; accepted so the empty
 # skeleton passes. Any other non-zero code is a failure.
+# temporary: remove when the first tests exist
 PYTEST_NO_TESTS = 5
 
-STEPS: list[tuple[str, list[str], set[int]]] = [
-    ("ruff", [sys.executable, "-m", "ruff", "check", "."], {0}),
-    ("mypy", [sys.executable, "-m", "mypy"], {0}),
-    ("pytest", [sys.executable, "-m", "pytest"], {0, PYTEST_NO_TESTS}),
-]
+
+def steps(area: str | None) -> list[tuple[str, list[str], set[int]]]:
+    py = sys.executable
+    if area is None:
+        ruff_paths = ["."]
+        mypy_args: list[str] = []  # packages listed in pyproject.toml
+        pytest_paths: list[str] = []  # testpaths in pyproject.toml
+    else:
+        package, tests = AREAS[area]
+        ruff_paths = [f"src/{package}", tests]
+        # mypy checks the package only, not its tests.
+        # temporary: remove when the first tests exist
+        mypy_args = ["-p", package]
+        pytest_paths = [tests]
+    return [
+        ("ruff", [py, "-m", "ruff", "check", *ruff_paths], {0}),
+        ("mypy", [py, "-m", "mypy", *mypy_args], {0}),
+        ("pytest", [py, "-m", "pytest", *pytest_paths], {0, PYTEST_NO_TESTS}),
+    ]
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("area", nargs="?", choices=sorted(AREAS))
+    args = parser.parse_args()
+
     failed: list[str] = []
-    for name, cmd, ok_codes in STEPS:
+    for name, cmd, ok_codes in steps(args.area):
         print(f"=== {name} ===", flush=True)
         code = subprocess.call(cmd, cwd=ROOT)
         if code not in ok_codes:
