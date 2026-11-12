@@ -22,7 +22,11 @@ cam = [
     "PyYAML>=6",
 ]
 step = []
-sim = []
+sim = [
+    "PyYAML>=6",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
