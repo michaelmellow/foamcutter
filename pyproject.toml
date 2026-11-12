@@ -14,10 +14,13 @@ dev = [
     "pytest",
     "ruff",
     "mypy",
+    "types-PyYAML",
 ]
 # Third-party libraries for each package. tests/step/ is skipped when any
 # library in the step group is not installed.
-cam = []
+cam = [
+    "PyYAML>=6",
+]
 step = []
 sim = []
 
@@ -35,9 +38,10 @@ extend-exclude = ["output"]
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"
-# Only the packages are checked, not tests/.
-# temporary: remove when the first tests exist
-packages = ["foamcam", "foamstep", "foamsim"]
+files = ["src", "tests"]
+# Module names come from the directory layout, so tests/*/conftest.py files
+# in different areas do not clash.
+explicit_package_bases = true
 strict = true
 
 [tool.pytest.ini_options]

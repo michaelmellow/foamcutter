@@ -18,29 +18,22 @@ AREAS = {
     "sim": ("foamsim", "tests/sim"),
 }
 
-# pytest exit code 5 means "no tests collected"; accepted so the empty
-# skeleton passes. Any other non-zero code is a failure.
-# temporary: remove when the first tests exist
-PYTEST_NO_TESTS = 5
-
 
 def steps(area: str | None) -> list[tuple[str, list[str], set[int]]]:
     py = sys.executable
     if area is None:
         ruff_paths = ["."]
-        mypy_args: list[str] = []  # packages listed in pyproject.toml
+        mypy_args: list[str] = []  # files listed in pyproject.toml
         pytest_paths: list[str] = []  # testpaths in pyproject.toml
     else:
         package, tests = AREAS[area]
         ruff_paths = [f"src/{package}", tests]
-        # mypy checks the package only, not its tests.
-        # temporary: remove when the first tests exist
-        mypy_args = ["-p", package]
+        mypy_args = [f"src/{package}", tests]
         pytest_paths = [tests]
     return [
         ("ruff", [py, "-m", "ruff", "check", *ruff_paths], {0}),
         ("mypy", [py, "-m", "mypy", *mypy_args], {0}),
-        ("pytest", [py, "-m", "pytest", *pytest_paths], {0, PYTEST_NO_TESTS}),
+        ("pytest", [py, "-m", "pytest", *pytest_paths], {0}),
     ]
 
 

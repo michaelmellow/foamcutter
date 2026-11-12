@@ -6,7 +6,7 @@
 
 **Tasks**
 
-1. Parse the G-code subset used here: G0, G1, G90, G91, G93, G94, G4, and the configured axis letters. Reject anything else.
+1. Parse the G-code subset used here: G0, G1, G21, G54, G90, G91, G93, G94, G4, and the configured axis letters. Reject anything else.
 2. Compute the wire line in 3D at every step from the four axis positions and the wire span.
 3. Intersect the wire with the root and tip planes of the block, and with any plane the operator asks for.
 4. Remove the kerf using the profile's table, and compare the result with the target sections in the job file. Report maximum deviation per section.
