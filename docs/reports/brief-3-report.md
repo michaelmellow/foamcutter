@@ -207,3 +207,13 @@ director corrected:
    Brief 1 branch has a WIP commit that predates this.
 6. The profile's `lead` field is recorded but unused by the software, as
    specified. Keep it?
+
+## 7. Director's decisions after review
+
+- §10.7 step 3: the replacement text in section 4 was approved and applied to
+  `docs/formats/job-file.md`. The code already implemented it.
+- Dev tools pinned in `pyproject.toml` to the versions that passed:
+  `pytest==9.2.0`, `ruff==0.17.4`, `mypy==2.4.1`. `types-PyYAML` is left
+  unpinned (not part of the decision).
+- `python check.py cam` and `python check.py` were run again after both
+  changes: all checks pass, 41 tests.

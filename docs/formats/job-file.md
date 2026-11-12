@@ -409,12 +409,13 @@ a straight line from where it is to `safe_position` without touching foam.
 2. **Kerf per edge.** Each edge of the outer contour and of each hole belongs
    to one move. Its kerf `k` is the kerf-table lookup (machine profile §7) of
    that move's speed at that edge's section plane.
-3. **Offset.** In each section plane, move every edge of the outer contour by
-   `k/2` along its normal away from the material, i.e. outward. Move every edge
-   of a hole by `k/2` into the hole. Each new vertex is the intersection of the
-   two offset edges that meet there. If the two edges are parallel (angle below
-   1e−9 rad) the vertex is moved by `k/2` along the common normal, using the
-   larger of the two kerfs.
+3. **Offset.** In each section plane, offset every edge of the outer contour
+   outward, and every edge of a hole into the hole. Each vertex `v` moves to
+   `v + h · (n1 + n2) / (1 + n1·n2)`, where `n1` and `n2` are the unit
+   normals of its two edges, pointing away from the material, and
+   `h = (k1 + k2) / 4` is the mean half kerf of the two edges. When both
+   edges have the same kerf this is the intersection of the two offset
+   edges. Edges of zero length are skipped.
 4. Slits, lead-ins, exits and `open` features are not offset. A slit runs
    straight from the offset slit point to the offset first vertex of its
    feature.

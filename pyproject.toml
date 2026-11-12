@@ -11,9 +11,9 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
-    "ruff",
-    "mypy",
+    "pytest==9.2.0",
+    "ruff==0.17.4",
+    "mypy==2.4.1",
     "types-PyYAML",
 ]
 # Third-party libraries for each package. tests/step/ is skipped when any
