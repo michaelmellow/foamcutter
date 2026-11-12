@@ -259,3 +259,15 @@ naive model.
    of "target point to cut surface" and "cut surface point to target") per
    element, excluding slits. Please confirm this is what "maximum deviation
    per section" should mean.
+
+## Director's decisions (after review)
+
+1. Open question 4: authorised. `pyproject.toml` now declares the `sim`
+   group (PyYAML, numpy, matplotlib) exactly as proposed above, and nothing
+   else in it changed. `python check.py sim` passes again: 97 passed,
+   3 xfailed. `pip install --dry-run -e ".[dev,cam,step,sim]"` resolves.
+2. Open question 3: the 0.05 mm examples test stays a strict expected
+   failure until the CAM is changed and the examples pass. The marker comes
+   off then.
+3. The simulator's method and tolerance are not changed in response to the
+   example results.
