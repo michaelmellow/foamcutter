@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 from . import __version__
 from . import geometry as g
@@ -15,6 +16,17 @@ Axes = tuple[float, float, float, float]
 
 # A path node is a reference into the geometry: ("outer", i) or ("feature", name, i).
 Ref = tuple[str, int] | tuple[str, str, int]
+
+# §10.7: the kerf lookup is repeated until no half kerf changes by more than
+# KERF_SETTLED mm, for at most KERF_ROUNDS lookups from the compensated path.
+KERF_ROUNDS = 10
+KERF_SETTLED = 0.001
+# §10.7: where the kerf changes at a vertex, the two offset edges are
+# intersected exactly if they turn by at least this angle (degrees);
+# otherwise the vertex takes the mean half kerf.
+EXACT_JOIN_ANGLE = 20.0
+# §10.3: two breakpoints closer than this (mm) at both faces are merged.
+MERGE_GAP = 0.001
 
 
 @dataclass
@@ -98,30 +110,148 @@ class Cam:
         self.tip = tip
         self.kerf = profile.kerf_tables[job.kerf_table]
         self.kerf_used: dict[str, list[float]] = {"root": [], "tip": []}
+        self.kerf_rounds: dict[str, int] = {}
+        self.stretches: list[tuple[str, float, float]] = []  # (from to, root kerf, tip kerf)
         self.problems: list[str] = []
 
-    # --- §10.3 synchronisation and §10.4 order of moves -------------------
+    # --- §10.7 kerf compensation and §10.3 synchronisation ----------------
 
-    def synchronise(self) -> tuple[list[Point], list[Point], list[str | None]]:
-        """Paired outer-contour nodes (closed: last = first) and the slit tag of each node."""
-        loop_r = traversal(self.root, self.job.direction)
-        loop_t = traversal(self.tip, self.job.direction)
-        pos_r, labels = fixed_points(self.root, self.job.direction)
-        pos_t, _ = fixed_points(self.tip, self.job.direction)
-        cr, ct = self.root.contour, self.tip.contour
-        nodes_r, nodes_t = [cr[loop_r[0]]], [ct[loop_t[0]]]
+    def compensate(self) -> tuple[dict[Ref, Point], dict[Ref, Point], list[str | None]]:
+        """Compensated points of every path node, and the slit tag of each outer node."""
+        nodes_r, nodes_t, tags = self.outer_contour()
+        comp_r: dict[Ref, Point] = {("outer", i): p for i, p in enumerate(nodes_r[:-1])}
+        comp_t: dict[Ref, Point] = {("outer", i): p for i, p in enumerate(nodes_t[:-1])}
+        for name, f_r in self.root.features.items():
+            f_t = self.tip.features[name]
+            placed_r = [self.root.place(p) for p in f_r.points]
+            placed_t = [self.tip.place(p) for p in f_t.points]
+            if f_r.kind == "hole":
+                # Feature edges are not resampled: each edge is one move with its own kerf.
+                k = len(placed_r)
+                edges = [[i] for i in range(k)]
+                placed_r, placed_t, _, _ = self.settle(f'feature "{name}"', placed_r, placed_t, edges, edges, False)
+            for i, (p, q) in enumerate(zip(placed_r, placed_t)):
+                comp_r[("feature", name, i)] = p
+                comp_t[("feature", name, i)] = q
+        return comp_r, comp_t, tags
+
+    def outer_contour(self) -> tuple[list[Point], list[Point], list[str | None]]:
+        """Compensated, paired outer-contour nodes (closed: last = first) and their slit tags.
+
+        Each stretch between fixed pairs has one kerf per face (§10.7). The two
+        offset polygons are then synchronised stretch by stretch (§10.3).
+        """
+        job = self.job
+        loop_r = traversal(self.root, job.direction)
+        loop_t = traversal(self.tip, job.direction)
+        pos_r, labels = fixed_points(self.root, job.direction)
+        pos_t, _ = fixed_points(self.tip, job.direction)
+        poly_r, pos_r = transition_vertices(
+            [self.root.place(self.root.contour[i]) for i in loop_r[:-1]], pos_r, job.max_segment_length
+        )
+        poly_t, pos_t = transition_vertices(
+            [self.tip.place(self.tip.contour[i]) for i in loop_t[:-1]], pos_t, job.max_segment_length
+        )
+        groups_r = [list(range(a, b)) for a, b in pairwise(pos_r)]
+        groups_t = [list(range(a, b)) for a, b in pairwise(pos_t)]
+        new_r, new_t, half_r, half_t = self.settle("outer contour", poly_r, poly_t, groups_r, groups_t, True)
+        self.stretches = [
+            (f"{labels[k]} to {labels[k + 1]}", 2 * hr, 2 * ht) for k, (hr, ht) in enumerate(zip(half_r, half_t))
+        ]
+
+        nodes_r, nodes_t = [new_r[0]], [new_t[0]]
         tags: list[str | None] = [slit_name(labels[0])]
         for k in range(1, len(pos_r)):
-            piece_r = [cr[i] for i in loop_r[pos_r[k - 1] : pos_r[k] + 1]]
-            piece_t = [ct[i] for i in loop_t[pos_t[k - 1] : pos_t[k] + 1]]
-            longest = max(g.length(piece_r), g.length(piece_t))
-            steps = max(1, math.ceil(longest / self.job.max_segment_length - 1e-9))
-            nodes_r += g.resample(piece_r, steps)
-            nodes_t += g.resample(piece_t, steps)
-            tags += [None] * (steps - 1) + [slit_name(labels[k])]
+            piece_r = [new_r[i % len(new_r)] for i in range(pos_r[k - 1], pos_r[k] + 1)]
+            piece_t = [new_t[i % len(new_t)] for i in range(pos_t[k - 1], pos_t[k] + 1)]
+            sync_r, sync_t = g.synchronise(piece_r, piece_t, job.max_segment_length, MERGE_GAP)
+            nodes_r += sync_r
+            nodes_t += sync_t
+            tags += [None] * (len(sync_r) - 1) + [slit_name(labels[k])]
         return nodes_r, nodes_t, tags
 
+    def settle(
+        self,
+        where: str,
+        poly_r: list[Point],
+        poly_t: list[Point],
+        groups_r: list[list[int]],
+        groups_t: list[list[int]],
+        outward: bool,
+    ) -> tuple[list[Point], list[Point], list[float], list[float]]:
+        """Offset two placed polygons, iterating the kerf of each group of edges (§10.7).
+
+        Group j of the root and group j of the tip are cut by the same moves.
+        Each group has one kerf per face, from the speed of its moves at that
+        face. Returns the two offset polygons and the settled half kerfs per group.
+        """
+
+        def offsets(half_r: list[float], half_t: list[float]) -> tuple[list[Point], list[Point]]:
+            return (
+                self.offset_face(self.root, poly_r, edge_halves(groups_r, half_r, len(poly_r)), outward, where),
+                self.offset_face(self.tip, poly_t, edge_halves(groups_t, half_t, len(poly_t)), outward, where),
+            )
+
+        # Every lookup outside the kerf table, from any round, stops the program.
+        out_of_table: list[str] = []
+        # First lookup from the speeds of the uncompensated path.
+        half_r, half_t = self.group_halves(poly_r, poly_t, groups_r, groups_t, out_of_table)
+        for rounds in range(1, KERF_ROUNDS + 1):
+            new_r, new_t = offsets(half_r, half_t)
+            next_r, next_t = self.group_halves(new_r, new_t, groups_r, groups_t, out_of_table)
+            change = max(abs(a - b) for a, b in zip(half_r + half_t, next_r + next_t))
+            if change <= KERF_SETTLED:
+                break
+            half_r, half_t = next_r, next_t
+        else:
+            raise CamError(
+                f"kerf compensation of the {where} has not settled after {KERF_ROUNDS} rounds: "
+                f"a half kerf still changes by {change:.4f} mm"
+            )
+        self.kerf_rounds[where] = rounds
+        if out_of_table:
+            # Reported with the other checks; the program is not written. The
+            # last message has the speed nearest to the real one.
+            self.problems.append(out_of_table[-1])
+        for label, half in (("root", half_r), ("tip", half_t)):
+            self.kerf_used[label] += [2 * h for h in half if h > 0]
+        return new_r, new_t, half_r, half_t
+
+    def group_halves(
+        self,
+        poly_r: list[Point],
+        poly_t: list[Point],
+        groups_r: list[list[int]],
+        groups_t: list[list[int]],
+        out_of_table: list[str],
+    ) -> tuple[list[float], list[float]]:
+        """Half the kerf of each group at each face, from the speed of its moves there.
+
+        Synchronisation moves both faces in proportion along a group, so its
+        speed at a face is cut_speed x (its length there) / (the longer of its two lengths).
+        A speed outside the kerf table is added to `out_of_table` and takes the
+        kerf at the nearer end of the table, so that the other checks can still run.
+        """
+        half_r: list[float] = []
+        half_t: list[float] = []
+        for group_r, group_t in zip(groups_r, groups_t):
+            dr = sum(g.dist(poly_r[i], poly_r[(i + 1) % len(poly_r)]) for i in group_r)
+            dt = sum(g.dist(poly_t[i], poly_t[(i + 1) % len(poly_t)]) for i in group_t)
+            fastest = max(dr, dt)
+            for d, half in ((dr, half_r), (dt, half_t)):
+                half.append(0.0 if d <= g.EPS else self.lookup(self.job.cut_speed * d / fastest, out_of_table) / 2)
+        return half_r, half_t
+
+    def lookup(self, speed: float, out_of_table: list[str]) -> float:
+        try:
+            return self.kerf.kerf(speed)
+        except CamError as error:
+            out_of_table.append(str(error))
+            points = self.kerf.points
+            return points[0][1] if speed < points[0][0] else points[-1][1]
+
     def path(self, n_outer: int, tags: list[str | None]) -> list[Ref]:
+        """§10.4: the order of moves through the path nodes."""
         refs: list[Ref] = []
         for i in range(n_outer + 1):
             refs.append(("outer", i % n_outer))
@@ -138,63 +268,18 @@ class Cam:
             refs.append(("outer", i % n_outer))
         return refs
 
-    # --- §10.7 kerf compensation ------------------------------------------
-
-    def compensate(
-        self, outer_r: list[Point], outer_t: list[Point]
-    ) -> tuple[dict[Ref, Point], dict[Ref, Point]]:
-        comp_r: dict[Ref, Point] = {}
-        comp_t: dict[Ref, Point] = {}
-        n = len(outer_r)
-        self.offset("outer", None, outer_r, outer_t, [("outer", i) for i in range(n)], True, comp_r, comp_t)
-        for name, f_r in self.root.features.items():
-            f_t = self.tip.features[name]
-            refs: list[Ref] = [("feature", name, i) for i in range(len(f_r.points))]
-            if f_r.kind == "hole":
-                self.offset(name, name, list(f_r.points), list(f_t.points), refs, False, comp_r, comp_t)
-            else:
-                for ref, p, q in zip(refs, f_r.points, f_t.points):
-                    comp_r[ref] = self.root.place(p)
-                    comp_t[ref] = self.tip.place(q)
-        return comp_r, comp_t
-
-    def offset(
-        self,
-        what: str,
-        feature: str | None,
-        poly_r: list[Point],
-        poly_t: list[Point],
-        refs: list[Ref],
-        outward: bool,
-        comp_r: dict[Ref, Point],
-        comp_t: dict[Ref, Point],
-    ) -> None:
-        n = len(poly_r)
-        half_r: list[float] = []
-        half_t: list[float] = []
-        for i in range(n):
-            # Speeds of this edge's move before compensation (§10.7 step 1).
-            dr = g.dist(poly_r[i], poly_r[(i + 1) % n])
-            dt = g.dist(poly_t[i], poly_t[(i + 1) % n])
-            fastest = max(dr, dt)
-            for d, half, label in ((dr, half_r, "root"), (dt, half_t, "tip")):
-                if d <= g.EPS:
-                    half.append(0.0)
-                    continue
-                k = self.kerf.kerf(self.job.cut_speed * d / fastest)
-                self.kerf_used[label].append(k)
-                half.append(k / 2)
-        for outline, poly, half, comp in ((self.root, poly_r, half_r, comp_r), (self.tip, poly_t, half_t, comp_t)):
-            placed = [outline.place(p) for p in poly]
-            for i, (new, h) in enumerate(g.offset_polygon(placed, half, outward)):
-                if g.dist(new, placed[i]) > 4 * h + 1e-9:
-                    where = "outer contour" if feature is None else f'feature "{feature}"'
-                    raise CamError(
-                        f"{outline.section.label}: kerf compensation of the {where} moves point {i} "
-                        f"at ({placed[i][0]:.3f}, {placed[i][1]:.3f}) by {g.dist(new, placed[i]):.3f} mm, "
-                        f"more than 4 x half the kerf; the corner is too sharp"
-                    )
-                comp[refs[i]] = new
+    def offset_face(self, outline: Outline, placed: list[Point], half: list[float], outward: bool, where: str) -> list[Point]:
+        """Offset one face's polygon (§10.7), with the guard against spikes."""
+        result: list[Point] = []
+        for i, (new, h) in enumerate(g.offset_polygon(placed, half, outward, EXACT_JOIN_ANGLE)):
+            if g.dist(new, placed[i]) > 4 * h + 1e-9:
+                raise CamError(
+                    f"{outline.section.label}: kerf compensation of the {where} moves point {i} "
+                    f"at ({placed[i][0]:.3f}, {placed[i][1]:.3f}) by {g.dist(new, placed[i]):.3f} mm, "
+                    f"more than 4 x half the kerf; the corner is too sharp"
+                )
+            result.append(new)
+        return result
 
     # --- §10.8 projection and §11 timing ----------------------------------
 
@@ -206,10 +291,8 @@ class Cam:
 
     def run(self) -> CamResult:
         job = self.job
-        nodes_r, nodes_t, tags = self.synchronise()
-        outer_r, outer_t = nodes_r[:-1], nodes_t[:-1]
-        refs = self.path(len(outer_r), tags)
-        comp_r, comp_t = self.compensate(outer_r, outer_t)
+        comp_r, comp_t, tags = self.compensate()
+        refs = self.path(len(tags) - 1, tags)
 
         x_entry = job.block.x + job.block.length + job.lead_in
         start = refs[0]
@@ -245,7 +328,7 @@ class Cam:
         from .output import preview_svg, report
 
         result.gcode = "\n".join(lines.text) + "\n"
-        result.report = report(job, self.profile, result, self.kerf_used)
+        result.report = report(job, self.profile, result, self.kerf_used, self.stretches, self.kerf_rounds)
         result.preview_svg = preview_svg(job, self.root, self.tip, comp_r, comp_t, refs)
         return result
 
@@ -268,12 +351,17 @@ class Cam:
         for code in ("G21", "G54", "G90", "G93"):
             program.add(code)
         previous_words = ""
+        carried = 0.0  # minutes of G1 lines dropped since the last one written
         for index, move in enumerate(moves):
             words = " ".join(f"{letter}{axis_value(v)}" for letter, v in zip(profile.letters, move.axes))
             if move.kind == "rapid":
                 program.add(f"G0 {words}", index)
-            elif words != previous_words:
-                program.add(f"G1 {words} F{inverse_time(move.duration)}", index)
+            elif words == previous_words:
+                # Same position after rounding (§13): drop the line, keep its time.
+                carried += move.duration
+            else:
+                program.add(f"G1 {words} F{inverse_time(move.duration + carried)}", index)
+                carried = 0.0
             previous_words = words
         program.add("G94")
         return program
@@ -362,6 +450,50 @@ class Program:
 
     def motion_lines(self) -> list[tuple[int, int]]:
         return sorted(self.move_of_line.items())
+
+
+def transition_vertices(polygon: list[Point], fixed: list[int], distance: float) -> tuple[list[Point], list[int]]:
+    """§10.7: confine the kerf change at each nearly-in-line join.
+
+    `polygon` is a closed contour in traversal order and `fixed` the positions
+    of its fixed points (the last is len(polygon), the start again). Where the
+    contour turns by less than EXACT_JOIN_ANGLE at a fixed point, a vertex is
+    added on each of its two edges `distance` from it, if that edge is longer.
+    Returns the new polygon and the new positions of the fixed points.
+    """
+    n = len(polygon)
+    joins = {p % n for p in fixed}
+    before: set[int] = set()  # add a vertex on the edge ending at this vertex
+    after: set[int] = set()  # add a vertex on the edge starting at this vertex
+    for j in joins:
+        if g.turn_angle(polygon, j) < EXACT_JOIN_ANGLE:
+            before.add(j)
+            after.add(j)
+    result: list[Point] = []
+    new_index: dict[int, int] = {}
+    for i in range(n):
+        a, b = polygon[i], polygon[(i + 1) % n]
+        new_index[i] = len(result)
+        result.append(a)
+        length = g.dist(a, b)
+        cuts = []
+        if i in after and length > distance + g.EPS:
+            cuts.append(distance / length)
+        if (i + 1) % n in before and length > distance + g.EPS:
+            cuts.append(1 - distance / length)
+        for f in sorted(set(cuts)):
+            if 0 < f < 1:
+                result.append((a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])))
+    return result, [new_index[p] if p < n else len(result) for p in fixed]
+
+
+def edge_halves(groups: list[list[int]], half: list[float], n: int) -> list[float]:
+    """Half kerf of every polygon edge, from the half kerf of its group."""
+    result = [0.0] * n
+    for group, h in zip(groups, half):
+        for i in group:
+            result[i] = h
+    return result
 
 
 def slit_name(label: str) -> str | None:

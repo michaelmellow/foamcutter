@@ -12,7 +12,14 @@ if TYPE_CHECKING:
     from .cam import CamResult, Ref
 
 
-def report(job: Job, profile: Profile, result: "CamResult", kerf_used: dict[str, list[float]]) -> str:
+def report(
+    job: Job,
+    profile: Profile,
+    result: "CamResult",
+    kerf_used: dict[str, list[float]],
+    stretches: list[tuple[str, float, float]],
+    kerf_rounds: dict[str, int],
+) -> str:
     from .cam import speed_ratio
 
     moves = result.moves
@@ -57,6 +64,9 @@ def report(job: Job, profile: Profile, result: "CamResult", kerf_used: dict[str,
         used = kerf_used[face]
         if used:
             lines.append(f"Kerf at {face}:  {min(used):.3f} to {max(used):.3f} mm (half applied each side)")
+    lines.append("Kerf per stretch of the outer contour (root / tip, mm):")
+    lines += [f"  {name}: {k_r:.3f} / {k_t:.3f}" for name, k_r, k_t in stretches]
+    lines.append("Kerf lookups from the compensated path: " + ", ".join(f"{w} {n}" for w, n in kerf_rounds.items()))
     faster = sum(max(m.root_length, m.tip_length) for m in feed)
     minutes = result.total_time
     lines += [

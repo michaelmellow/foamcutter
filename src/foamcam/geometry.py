@@ -22,24 +22,64 @@ def length(points: Sequence[Point]) -> float:
     return sum(dist(a, b) for a, b in pairwise(points))
 
 
-def resample(points: Sequence[Point], steps: int) -> list[Point]:
-    """Points at arc-length fractions j/steps, j = 1 … steps, along a polyline."""
+def cumulative_lengths(points: Sequence[Point]) -> list[float]:
     cumulative = [0.0]
     for a, b in pairwise(points):
         cumulative.append(cumulative[-1] + dist(a, b))
+    return cumulative
+
+
+def point_at(points: Sequence[Point], cumulative: Sequence[float], fraction: float) -> Point:
+    """Point at an arc-length fraction (0 … 1) along a polyline."""
     total = cumulative[-1]
-    result: list[Point] = []
-    for j in range(1, steps + 1):
-        if j == steps:
-            result.append(points[-1])
-            continue
-        target = total * j / steps
-        i = max(1, bisect_left(cumulative, target))
-        a, b = points[i - 1], points[i]
-        seg = cumulative[i] - cumulative[i - 1]
-        f = 0.0 if seg <= 0 else (target - cumulative[i - 1]) / seg
-        result.append((a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])))
-    return result
+    if fraction >= 1.0 or total <= 0:
+        return points[-1] if fraction >= 1.0 else points[0]
+    target = total * fraction
+    i = max(1, bisect_left(cumulative, target))
+    a, b = points[i - 1], points[i]
+    seg = cumulative[i] - cumulative[i - 1]
+    f = 0.0 if seg <= 0 else (target - cumulative[i - 1]) / seg
+    return a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])
+
+
+def synchronise(
+    piece_r: Sequence[Point], piece_t: Sequence[Point], max_segment: float, merge_gap: float
+) -> tuple[list[Point], list[Point]]:
+    """Paired points along two polylines between fixed pairs (job-file.md §10.3).
+
+    The breakpoints are the arc-length fractions of every vertex of both pieces,
+    with extra equal steps between them so that no move is longer than
+    `max_segment` on either piece. Both pieces are evaluated at every breakpoint,
+    so each piece's own vertices are kept exactly, except that a breakpoint less
+    than `merge_gap` from the previous one at both faces is dropped (the last
+    one, fraction 1, replaces its predecessor instead). Returns the points at
+    fractions above 0, ending with the last point of each piece.
+    """
+    cum_r, cum_t = cumulative_lengths(piece_r), cumulative_lengths(piece_t)
+    fractions = {1.0}
+    for cumulative in (cum_r, cum_t):
+        if cumulative[-1] > 0:
+            fractions.update(c / cumulative[-1] for c in cumulative[1:-1])
+    longest = max(cum_r[-1], cum_t[-1])
+    # Between two breakpoints neither piece has a vertex, so a fraction step w
+    # moves w x length at each face: both are below merge_gap when the longer is.
+    breaks = [0.0]
+    for f in sorted(fractions):
+        if (f - breaks[-1]) * longest >= merge_gap:
+            breaks.append(f)
+        elif f == 1.0 and len(breaks) > 1:
+            breaks[-1] = 1.0
+    if breaks[-1] != 1.0:
+        breaks.append(1.0)
+    nodes_r: list[Point] = []
+    nodes_t: list[Point] = []
+    for a, b in pairwise(breaks):
+        steps = max(1, math.ceil((b - a) * longest / max_segment - 1e-9))
+        for j in range(1, steps + 1):
+            f = b if j == steps else a + (b - a) * j / steps
+            nodes_r.append(point_at(piece_r, cum_r, f))
+            nodes_t.append(point_at(piece_t, cum_t, f))
+    return nodes_r, nodes_t
 
 
 def signed_area(polygon: Sequence[Point]) -> float:
@@ -110,8 +150,24 @@ def ray_hit(origin: Point, direction: Point, polygon: Sequence[Point]) -> tuple[
     return best
 
 
-def offset_polygon(polygon: Sequence[Point], half_kerf: Sequence[float], outward: bool) -> list[tuple[Point, float]]:
-    """Mitred offset of a closed polygon (job-file.md §10.7, step 3).
+def turn_angle(polygon: Sequence[Point], v: int) -> float:
+    """Angle in degrees by which a closed polygon turns at vertex v, skipping zero-length edges."""
+    n = len(polygon)
+    i = (v - 1) % n
+    while dist(polygon[i], polygon[v]) <= EPS and i != v:
+        i = (i - 1) % n
+    j = (v + 1) % n
+    while dist(polygon[v], polygon[j]) <= EPS and j != v:
+        j = (j + 1) % n
+    d1 = (polygon[v][0] - polygon[i][0], polygon[v][1] - polygon[i][1])
+    d2 = (polygon[j][0] - polygon[v][0], polygon[j][1] - polygon[v][1])
+    return abs(math.degrees(math.atan2(d1[0] * d2[1] - d1[1] * d2[0], d1[0] * d2[0] + d1[1] * d2[1])))
+
+
+def offset_polygon(
+    polygon: Sequence[Point], half_kerf: Sequence[float], outward: bool, exact_angle: float
+) -> list[tuple[Point, float]]:
+    """Mitred offset of a closed polygon (job-file.md §10.7).
 
     Edge i runs from vertex i to vertex i+1 and moves by half_kerf[i]. With
     `outward` the edges move away from the inside of the polygon, otherwise
@@ -119,10 +175,11 @@ def offset_polygon(polygon: Sequence[Point], half_kerf: Sequence[float], outward
     the nearest real edges. Returns each new vertex with the larger half kerf
     of the two edges that define it.
 
-    Each vertex is mitred with the mean half kerf h of its two edges:
-    v + h (n1 + n2) / (1 + n1·n2). With equal kerfs this is exactly the
-    intersection of the two offset edges. Intersecting edges offset by
-    different amounts would run away where two edges are nearly collinear.
+    Each new vertex is v + a·n1 + b·n2, where n1 and n2 are the unit normals
+    of the two edges. If both half kerfs are equal, or the edges turn by at
+    least `exact_angle` degrees, it is the intersection of the two offset
+    edges. Otherwise (nearly collinear edges with different kerfs, whose
+    intersection runs far away) it uses the mean half kerf of the two edges.
     """
     n = len(polygon)
     lengths = [dist(polygon[i], polygon[(i + 1) % n]) for i in range(n)]
@@ -148,13 +205,17 @@ def offset_polygon(polygon: Sequence[Point], half_kerf: Sequence[float], outward
         e2 = real_edge(v, +1)  # edge leaving v
         h1, h2 = half_kerf[e1], half_kerf[e2]
         n1, n2 = normal(e1), normal(e2)
-        h = (h1 + h2) / 2
         px, py = polygon[v]
         dot = n1[0] * n2[0] + n1[1] * n2[1]
         if dot <= -1 + EPS:
             # The contour doubles back on itself: no finite mitre.
             result.append(((math.inf, math.inf), max(h1, h2)))
             continue
-        f = h / (1 + dot)
-        result.append(((px + f * (n1[0] + n2[0]), py + f * (n1[1] + n2[1])), max(h1, h2)))
+        if h1 != h2 and dot <= math.cos(math.radians(exact_angle)):
+            # Intersection of the offset lines: q·n1 = v·n1 + h1 and q·n2 = v·n2 + h2.
+            a = (h1 - dot * h2) / (1 - dot * dot)
+            b = (h2 - dot * h1) / (1 - dot * dot)
+        else:
+            a = b = (h1 + h2) / 2 / (1 + dot)
+        result.append(((px + a * n1[0] + b * n2[0], py + a * n1[1] + b * n2[1]), max(h1, h2)))
     return result

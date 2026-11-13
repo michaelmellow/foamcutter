@@ -62,7 +62,7 @@ tip: { ... }
 | `kerf_table` | text | yes | Name of a kerf table in the machine profile. |
 | `cut_speed` | number, mm/min | yes | Wire speed at the faster of the two foam faces during every feed move (§11). > 0. |
 | `direction` | text | yes | `"upper_first"` or `"lower_first"`. Order in which the outer contour is cut (§10.1). |
-| `max_segment_length` | number, mm | yes | Largest length of one move along the outer contour, at either foam face, before kerf compensation (§10.3). > 0. A value of 1.0 is suitable for wings. |
+| `max_segment_length` | number, mm | yes | Largest length of one move along the outer contour, at either foam face, measured along the kerf-compensated contour (§10.3). > 0. A value of 1.0 is suitable for wings. |
 | `min_te_thickness` | number, mm | yes | Smallest trailing-edge thickness, in mm at the actual chord (§6.2). ≥ 0. Use 0 to leave the trailing edge unchanged. |
 | `lead_in` | number, mm | yes | Clearance along `x` between the block's front face and the entry point, where the wire starts and ends its cut (§10.5). > 0. |
 | `safe_position` | list of 4 numbers, mm | yes | Axis 1 to axis 4 G54 positions where the program starts and ends (§10.6). |
@@ -344,18 +344,52 @@ The start point is called `S`.
 
 These points are matched one to one between root and tip: `S`, the leading
 edge, the far trailing-edge point, the slit points, and every vertex of every
-feature. All work in §10 uses the untwisted, unplaced contours of §6.3 with the
-slit points inserted as extra vertices.
+feature. The slit points are inserted into the outer contour of §6.3 as extra
+vertices. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
+the placed contours of §6.5, in each section plane. Twist and placement are a
+rotation and a translation, so lengths and angles are the same in both frames.
+
+The fixed points divide the outer contour into **stretches**: from each fixed
+point to the next in the traversal direction (§10.1). The last stretch runs
+from the far trailing-edge point over the trailing-edge face back to `S`.
+Root stretch number *k* and tip stretch number *k* are cut by the same moves.
 
 ### 10.3 Synchronisation
 
-Between two consecutive fixed points on the outer contour, the root piece has
-arc length `Lr` and the tip piece `Lt`. Both are divided into
-`m = max(1, ceil(max(Lr, Lt) / max_segment_length))` equal arc-length steps. The
-point at step `j` (j = 1 … m) on each piece is the point at arc length
-`j/m` of that piece along its polyline. Root point `j` is paired with tip point
-`j`. The trailing-edge face, from the last contour point back to `S`, is one
-such piece. Feature vertices are not resampled.
+Synchronisation pairs points of the two **offset contours**: the outer contour
+of each section after kerf compensation (§10.7), so the lengths below are the
+lengths the wire actually travels at each foam face.
+
+For one stretch, let the root piece of the offset contour have arc length `Lr`
+and the tip piece `Lt`. A point of a piece is given by its arc-length fraction
+`f`, from 0 at the stretch's first fixed point to 1 at its last.
+
+The **breakpoints** of the stretch are, in increasing `f`:
+
+1. the fraction of every vertex of the root piece;
+2. the fraction of every vertex of the tip piece;
+3. between two consecutive breakpoints `a < b` from 1 and 2 (and 0 and 1),
+   extra equal steps: the interval is divided into
+   `m = max(1, ceil((b − a) · max(Lr, Lt) / max_segment_length))` equal parts.
+
+A breakpoint less than 0.001 mm after the one before it at both faces, that is
+`(f − f_previous) · max(Lr, Lt) < 0.001`, is dropped. If the dropped breakpoint
+is the end of the stretch (`f = 1`), it takes the place of the one before it
+instead, unless that one is the start.
+
+Both pieces are evaluated at every breakpoint. Root point `j` is paired with
+tip point `j`. So each offset contour passes through every one of its own
+vertices, except those within 0.001 mm of another breakpoint. With zero kerf
+the offset contour is the target contour, and the path passes through every
+target vertex.
+
+Between two consecutive breakpoints neither piece has a vertex. Every move is
+therefore a straight part of the offset contour at both faces, `(b − a)·Lr`
+long at the root and `(b − a)·Lt` at the tip. Its speed at each face (§11) is
+`cut_speed · L / max(Lr, Lt)` with that face's `L`: the same for every move of
+the stretch.
+
+Feature vertices are not resampled.
 
 ### 10.4 Order of moves
 
@@ -404,26 +438,60 @@ a straight line from where it is to `safe_position` without touching foam.
 
 ### 10.7 Kerf compensation
 
-1. **Speeds.** Compute move durations (§11) from the uncompensated, placed
-   points. For each move, find the wire speed at each section plane.
-2. **Kerf per edge.** Each edge of the outer contour and of each hole belongs
-   to one move. Its kerf `k` is the kerf-table lookup (machine profile §7) of
-   that move's speed at that edge's section plane.
-3. **Offset.** In each section plane, offset every edge of the outer contour
-   outward, and every edge of a hole into the hole. Each vertex `v` moves to
-   `v + h · (n1 + n2) / (1 + n1·n2)`, where `n1` and `n2` are the unit
-   normals of its two edges, pointing away from the material, and
-   `h = (k1 + k2) / 4` is the mean half kerf of the two edges. When both
-   edges have the same kerf this is the intersection of the two offset
-   edges. Edges of zero length are skipped.
-4. Slits, lead-ins, exits and `open` features are not offset. A slit runs
+1. **Kerf groups.** Each stretch of the outer contour (§10.2) has one kerf at
+   the root face and one at the tip face, used for all its edges. Each edge of
+   a hole has its own kerf at each face: feature edges are not resampled, so
+   each one is one move.
+2. **Speed of a group.** Let `L_r` and `L_t` be the group's lengths in the
+   offset contours: the stretch's arc lengths for a stretch, the edge's lengths
+   for a hole edge. Its speed at a face is `cut_speed · L / max(L_r, L_t)` with
+   that face's `L`. This is the speed of every move of the group at that face
+   (§10.3, §11). A group of zero length at a face has kerf 0 there.
+3. **Kerf.** The kerf of a group at a face is the kerf-table lookup (machine
+   profile §7) of its speed at that face. Each edge is offset by half its
+   group's kerf.
+4. **Transition vertices.** A **join** is a fixed point of the outer contour,
+   where one stretch ends and the next begins, so the kerf may change there. A
+   join is **nearly in line** if the target contour turns there by less than
+   **20°** (the angle between the directions of its two edges). At every
+   nearly-in-line join, before offsetting, a vertex is added to the target
+   contour on each of the two edges that meet there, at `max_segment_length`
+   from the join along that edge, if the edge is longer than that. The kerf
+   change between the two stretches is then made within `max_segment_length`
+   of the join on each side. The added vertices are vertices for §10.3.
+5. **Offset.** In each section plane, offset every edge of the outer contour
+   outward, and every edge of a hole into the hole, by its half kerf. Let `n1`
+   and `n2` be the unit normals of the two edges at vertex `v`, pointing away
+   from the material, `h1` and `h2` their half kerfs and `c = n1·n2`. The new
+   vertex is `v + a·n1 + b·n2` with:
+   - if `h1 = h2`, or the two edges turn by 20° or more: the intersection of
+     the two offset edges,
+     `a = (h1 − c·h2) / (1 − c²)`, `b = (h2 − c·h1) / (1 − c²)`
+     (for `h1 = h2` this is `a = b = h1 / (1 + c)`);
+   - otherwise (nearly in line, with different kerfs, where the intersection
+     would lie far away): the mean half kerf,
+     `a = b = (h1 + h2) / 2 / (1 + c)`.
+
+   Edges of zero length are skipped.
+6. **Iteration.** The first lookup uses the speeds of the target contours
+   (step 2 with the target lengths). Then, repeatedly: offset from the target
+   contours with the current kerfs (step 5), compute the speeds of the offset
+   contours (step 2) and look the kerfs up again (step 3). When no half kerf
+   of any group at either face changes by more than 0.001 mm, the kerfs have
+   settled and the offset contours just computed are used. If they have not
+   settled after 10 lookups from offset contours, the CAM stops with an error
+   naming the contour or feature. Each outer contour and each hole settles on
+   its own.
+7. Slits, lead-ins, exits and `open` features are not offset. A slit runs
    straight from the offset slit point to the offset first vertex of its
    feature.
-5. If a vertex moves by more than 4 × (k/2), the CAM stops with an error naming
-   the section and the point, rather than cutting a spike.
+8. If a vertex moves by more than 4 × the larger half kerf of its two edges,
+   the CAM stops with an error naming the section and the point, rather than
+   cutting a spike.
 
-Kerf is looked up from speeds of the uncompensated path. The speeds of the
-compensated path differ slightly; this is accepted and not iterated.
+At a nearly-in-line join where the kerf changes, the moves within
+`max_segment_length` of the join have a kerf between the kerfs of the two
+stretches. Everywhere else every move has the kerf of its own speed.
 
 ### 10.8 Projection to the towers
 
@@ -453,6 +521,10 @@ are dropped. Total cut time = sum of `T` = (path length at the faster face) /
 `cut_speed`, where that path length is the sum of `max(d_r, d_t)` over all
 feed moves.
 
+After rounding the positions for output (§13), a `G1` line whose four axis
+words equal those of the motion line before it is not written. Its duration
+is added to the next `G1` line, so the total cut time is unchanged.
+
 ### 11.1 Checks
 
 The CAM refuses to write a program, and names the line, axis and amount, if
@@ -467,6 +539,11 @@ any of these fails:
   (§10.5), the speed ratio at the foam faces is at most `max_speed_ratio`.
 - **Axis rate.** For every feed move, each axis's speed `|Δa| / T` is at most
   that axis's `max_rate`.
+- **Kerf table range.** If any kerf lookup of §10.7, in any round, falls
+  outside the kerf table, the error has the exact message of machine
+  profile §7, and no program is written. So that the other checks can be
+  reported in the same run, the CAM continues with the kerf at the nearer end
+  of the table. That value is used only to let the other checks run.
 
 Nothing is clipped or adjusted to make a check pass.
 

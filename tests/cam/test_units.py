@@ -13,11 +13,13 @@ from foamcam import (
     CamError,
     ValidationError,
     generate,
+    geometry,
     load_job,
     load_profile,
     load_profile_text,
 )
-from foamcam.cam import Cam, validate
+from foamcam import cam as cam_module
+from foamcam.cam import EXACT_JOIN_ANGLE, Cam, Move, transition_vertices, validate
 from foamcam.cli import main
 from foamcam.dat import parse_dat, read_dat
 from foamcam.geometry import dist
@@ -166,8 +168,7 @@ def test_compensated_contour_is_half_kerf_from_target(tmp_path: Path) -> None:
     prof = load_profile(write_yaml(tmp_path / "profile.yaml", profile))
     root, tip = validate(job, prof)
     cam = Cam(job, prof, root, tip)
-    nodes_r, nodes_t, _ = cam.synchronise()
-    comp_r, comp_t = cam.compensate(nodes_r[:-1], nodes_t[:-1])
+    comp_r, comp_t, _ = cam.compensate()
     for outline, comp in ((root, comp_r), (tip, comp_t)):
         target = [outline.place(p) for p in outline.contour]
         distances = [
@@ -200,6 +201,103 @@ def segment_distance(p: tuple[float, float], a: tuple[float, float], b: tuple[fl
 def test_speed_outside_kerf_table_stops_the_cut(tmp_path: Path) -> None:
     with pytest.raises(CamError, match=r"outside the table range 30 to 480"):
         run(tmp_path, wing_job(cut_speed=600.0))
+
+
+def test_out_of_table_speed_is_reported_with_the_other_checks(tmp_path: Path) -> None:
+    """§11.1: the lookup failure keeps the exact message of machine-profile.md §7, and the
+    other checks still run, so every problem is reported together."""
+    profile = sample_profile_data()
+    profile["axes"][3]["max"] = 30.0  # axis 4 goes higher than this
+    with pytest.raises(CamError) as caught:
+        run(tmp_path, wing_job(cut_speed=600.0), profile)
+    problems = caught.value.problems
+    pattern = r'kerf table "eps-20-sample": speed \d+\.\d mm/min is outside the table range 30 to 480 mm/min'
+    assert any(re.fullmatch(pattern, p) for p in problems), problems
+    assert any(p.startswith("axis 4 (A) goes to") for p in problems), problems
+
+
+def test_out_of_table_speed_writes_no_program(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    job = write_yaml(tmp_path / "wing.yaml", wing_job(cut_speed=600.0))
+    out = tmp_path / "out"
+    assert main(["cut", str(job), "--profile", str(SAMPLE_PROFILE), "--out", str(out)]) == 1
+    assert "outside the table range" in capsys.readouterr().err
+    assert not out.exists() or not any(out.iterdir())
+
+
+def test_kerf_that_does_not_settle_stops_the_cut(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The tapered wing needs more than one lookup from the compensated path.
+    monkeypatch.setattr(cam_module, "KERF_ROUNDS", 1)
+    with pytest.raises(CamError, match=r"kerf compensation of the outer contour has not settled after 1 rounds"):
+        run(tmp_path, wing_job())
+
+
+def corner(turn: float) -> list[tuple[float, float]]:
+    """A closed polygon that turns by `turn` degrees at vertex 1, the origin."""
+    t = math.radians(turn)
+    return [(-10.0, 0.0), (0.0, 0.0), (10 * math.cos(t), 10 * math.sin(t)), (0.0, -30.0)]
+
+
+def line_distance(p: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+    return abs((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) / dist(a, b)
+
+
+@pytest.mark.parametrize("turn", [EXACT_JOIN_ANGLE - 1.0, EXACT_JOIN_ANGLE + 1.0])
+def test_join_with_a_kerf_change_either_side_of_the_threshold(turn: float) -> None:
+    """§10.7: below the threshold angle the join takes the mean half kerf; at or above it,
+    the exact intersection of the two offset edges."""
+    polygon = corner(turn)
+    new, _ = geometry.offset_polygon(polygon, [0.5, 0.6, 0.5, 0.5], True, EXACT_JOIN_ANGLE)[1]
+    d1 = line_distance(new, polygon[0], polygon[1])
+    d2 = line_distance(new, polygon[1], polygon[2])
+    if turn < EXACT_JOIN_ANGLE:
+        assert d1 == pytest.approx(0.55, abs=1e-12) and d2 == pytest.approx(0.55, abs=1e-12)
+    else:
+        assert d1 == pytest.approx(0.5, abs=1e-12) and d2 == pytest.approx(0.6, abs=1e-12)
+
+
+@pytest.mark.parametrize("turn", [EXACT_JOIN_ANGLE - 1.0, EXACT_JOIN_ANGLE + 1.0])
+def test_transition_vertices_only_at_nearly_in_line_joins(turn: float) -> None:
+    polygon = corner(turn)
+    new, fixed = transition_vertices(polygon, [0, 1, 4], 1.0)
+    if turn < EXACT_JOIN_ANGLE:
+        # One vertex 1.0 either side of the join at vertex 1; none at vertex 0 (a sharp corner).
+        assert fixed == [0, 2, 6]
+        assert new[1] == pytest.approx((-1.0, 0.0)) and new[2] == polygon[1]
+        assert dist(new[3], polygon[1]) == pytest.approx(1.0)
+    else:
+        assert (new, fixed) == (polygon, [0, 1, 4])
+
+
+@pytest.mark.parametrize(("delta", "nodes"), [(0.0004, 2), (0.0006, 3)])
+def test_breakpoints_merge_only_when_closer_than_0_001_at_both_faces(delta: float, nodes: int) -> None:
+    """§10.3: vertex fractions 0.5 and 0.5 + delta on pieces of length 2 are 2 * delta mm apart."""
+    a = 1.0 + 2 * delta
+    piece_r = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+    piece_t = [(0.0, 0.0), (a, 0.0), (a, 2.0 - a)]
+    nodes_r, nodes_t = geometry.synchronise(piece_r, piece_t, 10.0, 0.001)
+    assert len(nodes_r) == nodes
+    assert nodes_r[-1] == piece_r[-1] and nodes_t[-1] == piece_t[-1]
+    for piece, found in ((piece_r, nodes_r), (piece_t, nodes_t)):
+        assert min(dist(piece[1], p) for p in found) < 0.001
+        if nodes == 3:
+            assert piece[1] in found
+
+
+def test_g1_line_equal_after_rounding_is_dropped_and_its_time_kept(tmp_path: Path) -> None:
+    """§13: a G1 whose four axis words equal the previous line's is not written; its time
+    is added to the next move."""
+    job = load_job(write_yaml(tmp_path / "job.yaml", wing_job()))
+    prof = load_profile(SAMPLE_PROFILE)
+    cam = Cam(job, prof, *validate(job, prof))
+    a, b, c = (300.0, 30.0, 300.0, 30.0), (290.0, 30.0, 290.0, 30.0), (280.0, 30.0, 280.0, 30.0)
+    moves = [
+        Move("rapid", a),
+        Move("lead_in", b, 0.5),
+        Move("cut", (290.00001, 30.0, 290.0, 30.0), 0.25),  # rounds to b
+        Move("cut", c, 0.25),
+    ]
+    lines = [line for line in cam.gcode_lines(moves).text if line.startswith("G1")]
+    assert lines == ["G1 X290.0000 Y30.0000 Z290.0000 A30.0000 F2.00000", "G1 X280.0000 Y30.0000 Z280.0000 A30.0000 F2.00000"]
 
 
 # --- G-code (job-file.md §13) -----------------------------------------------
