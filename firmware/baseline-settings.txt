@@ -1,0 +1,144 @@
+; Baseline grblHAL settings for the foam cutter (firmware in firmware/release/).
+;
+; Send this file only through "python firmware/settings.py", which writes
+; output/baseline-settings.nc with the comments removed. grblHAL passes a
+; comment on a $ line to the setting parser, so comments sit on their own lines.
+;
+; Apply it to a freshly flashed board after "$RST=*". Every setting not listed
+; keeps its grblHAL default. Setting numbers and meanings are from grblHAL core
+; 26d44fe73329 (grbl/settings.h, grbl/settings.c) and the Trinamic plugin
+; 7567c340cf97 (motors/trinamic.c). Values marked START are first guesses to be
+; replaced during commissioning (firmware/commissioning.md); they are not
+; measurements of the machine.
+;
+; Axis order: X = axis 1 (left horizontal, slot X), Y = axis 2 (left vertical,
+; slot Y), Z = axis 3 (right horizontal, slot Z), A = axis 4 (right vertical,
+; slot E0). Axis bit masks: X = 1, Y = 2, Z = 4, A = 8.
+
+; ---- Stepper signals -------------------------------------------------------
+; $1 Step idle delay. 255 keeps the motors enabled, so the wire does not drift
+; when idle. Standstill current is set by $21x below.
+$1=255
+; $3 Direction invert mask. START: 0. Set per axis in commissioning step 3.
+$3=0
+; $4 Enable invert mask. TMC2209 EN is active low. 15 is the grblHAL default
+; (DEFAULT_ENABLE_SIGNALS_INVERT_MASK = AXES_BITMASK), stated here so it is explicit.
+$4=15
+
+; ---- Inputs ----------------------------------------------------------------
+; $5 Limit invert mask. 0: an input counts as triggered when it reads high
+; (driver.c limitsGetState). The TMC2209 DIAG output goes high on a stall.
+; A normally closed switch to GND also reads high when it opens. No inversion.
+$5=0
+; $14 Control invert mask. Bit 1 feed hold (2), bit 2 cycle start (4), bit 6
+; e-stop (64). With $14 = 0 an input is active when it reads high, which with
+; the pull-up means "switch open". Feed hold and cycle start are normally open
+; push buttons to GND, so they are inverted (2 + 4). The e-stop is a normally
+; closed contact to GND and is NOT inverted: a broken wire also stops the machine.
+$14=6
+
+; ---- Limits and homing -----------------------------------------------------
+; $20 Soft limits. Off until travel has been measured (commissioning step 7).
+$20=0
+; $21 Hard limits. Off. With sensorless homing the limit inputs carry DIAG, and
+; the TMC2209 also drives DIAG on driver errors, not only on stalls. Turn on
+; only if mechanical switches are fitted instead.
+$21=0
+; $22 Homing: enable (1) + single-axis $H<letter> commands (2) = 3.
+; Commissioning step 6 adds "homing required at start-up" (4), giving 7, once
+; homing works. Until then that bit would hold the board in Alarm 11 at every
+; reset and lock out jogging (protocol.c:137-145).
+$22=3
+; $23 Homing direction mask, bit set = search in the negative direction.
+; Horizontal axes (X, Z) home toward the back (negative, bits 1 + 4). Vertical
+; axes (Y, A) home up (positive, bits clear), lifting the wire clear of the
+; table and the x reference face. Confirm in commissioning step 6.
+$23=5
+; $24 Homing locate (slow) rate, mm/min. START.
+$24=100
+; $25 Homing seek (fast) rate, mm/min. START.
+$25=400
+; $26 Homing debounce delay, ms. grblHAL default.
+$26=250
+; $27 Homing pull-off, mm. START. Must back the carriage off the stop far enough
+; that the next phase starts clear of it.
+$27=2.0
+; $43 Homing locate passes. 1.
+$43=1
+; $44 Homing phase 1: vertical axes Y + A (2 + 8). They lift the wire first.
+$44=10
+; $45 Homing phase 2: horizontal axes X + Z (1 + 4).
+$45=5
+; $46 Homing phase 3: none.
+$46=0
+
+; ---- Axes ------------------------------------------------------------------
+; $10x Steps per mm = 200 full steps/rev x 16 microsteps / lead.
+; START: lead 8 mm (examples/profiles/sample-machine.yaml) gives 400.
+; Replace with the lead of each axis from the real machine profile.
+$100=400
+$101=400
+$102=400
+$103=400
+; $11x Maximum rate, mm/min. START: max_rate from the sample profile. Must be at
+; least the profile's max_rate, or the planner caps feed moves (planner.c:326)
+; and G93 moves take longer than commanded.
+$110=1200
+$111=1200
+$112=1200
+$113=1200
+; $12x Acceleration, mm/s^2. START.
+$120=100
+$121=100
+$122=100
+$123=100
+; $13x Maximum travel, mm. START: max - min of the sample profile. Homing seeks
+; up to 1.5 x this distance (machine_limits.c:306, HOMING_AXIS_SEARCH_SCALAR),
+; so it must be at least the real travel. Measured in commissioning step 7.
+$130=600
+$131=350
+$132=600
+$133=350
+
+; ---- Trinamic plugin -------------------------------------------------------
+; $338 Trinamic drivers enabled on axes: all four (15).
+$338=15
+; $339 Sensorless homing on axes: all four (15).
+$339=15
+; $14x Motor run current, mA RMS. START: 700. The Creality 42-40 rated current
+; is NOT verified (retail listings give 1.0 A or 1.5 A per phase; see the
+; Brief 1 report). 700 mA is 70 % of the lower figure. Set from the motor label.
+$140=700
+$141=700
+$142=700
+$143=700
+; $15x Microsteps. 16 (plugin default). $10x above assumes 16.
+$150=16
+$151=16
+$152=16
+$153=16
+; $20x StallGuard4 threshold for the seek phase, 0-255. Plugin default 22.
+; Written unchanged to the TMC2209 SGTHRS register (trinamic/tmc2209hal.c:167).
+; Per the TMC2209 datasheet (not re-checked in this session) a stall is flagged
+; when SG_RESULT <= 2 x SGTHRS, so a higher value is more sensitive. Stall
+; detection is only active above 2/3 of the homing rate (tmc2209hal.c:165).
+; Tuned in commissioning step 5.
+$200=22
+$201=22
+$202=22
+$203=22
+; $21x Standstill current, % of $14x. Plugin default 50.
+$210=50
+$211=50
+$212=50
+$213=50
+; $22x StallGuard4 threshold for the locate phase, 0-255. Plugin default 22.
+$220=22
+$221=22
+$222=22
+$223=22
+
+; ---- Other -----------------------------------------------------------------
+; $376 Rotary axes mask. 0: all four axes are linear. The build already sets
+; DEFAULT_AXIS_ROTATIONAL_MASK=0; stated here so a $RST cannot hide a change.
+$376=0
