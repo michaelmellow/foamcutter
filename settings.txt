@@ -1,6 +1,6 @@
 %
 ;
-; 2026-11-13T16:54
+; 2026-11-13T17:00
 ;
 ; grblHAL
 ; 1.1f.20260622
@@ -85,7 +85,7 @@ $35=0.0
 ; 36 - Spindle PWM max value
 $36=100.0
 ; 37 - Steppers to keep enabled
-$37=0
+$37=15
 ; 39 - Enable legacy RT commands
 $39=1
 ; 40 - Limit jog commands
@@ -215,7 +215,7 @@ $370=0
 ; 372 - Invert I/O Port outputs
 $372=0
 ; 376 - Rotary axes
-$376=1
+$376=0
 ; 384 - Disable G92 persistence
 $384=0
 ; 392 - Spindle on delay
