@@ -128,10 +128,11 @@ def feed_moves(gcode: str, letters: tuple[str, ...]) -> list[tuple[Axes, Axes, f
     """Every G1 move as (start axes, end axes, F)."""
     moves: list[tuple[Axes, Axes, float]] = []
     previous: Axes | None = None
-    for line in gcode.splitlines():
+    lines = [line for line in gcode.splitlines() if line.startswith(("G0 ", "G1 "))]
+    # The first motion line is the opening lift (§10.6): only the two vertical axes.
+    assert [w[0] for w in lines[0].split()[1:]] == [letters[1], letters[3]], lines[0]
+    for line in lines[1:]:
         words = line.split()
-        if not words or words[0] not in ("G0", "G1"):
-            continue
         values = {w[0]: float(w[1:]) for w in words[1:]}
         axes = (values[letters[0]], values[letters[1]], values[letters[2]], values[letters[3]])
         if words[0] == "G1":

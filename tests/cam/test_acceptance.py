@@ -36,18 +36,26 @@ def write_yaml(path: Path, data: dict[str, Any]) -> Path:
 def motions(gcode: str, letters: tuple[str, ...] = AXIS_LETTERS) -> list[Motion]:
     """Parse G0/G1 lines into (command, (a1, a2, a3, a4), F or None)."""
     result: list[Motion] = []
-    for line in gcode.splitlines():
+    for line in without_opening_lift(gcode, letters):
         words = line.split()
-        if not words or words[0] not in ("G0", "G1"):
-            continue
         values = {w[0]: float(w[1:]) for w in words[1:]}
         axes = (values[letters[0]], values[letters[1]], values[letters[2]], values[letters[3]])
         result.append((words[0], axes, values.get("F")))
     return result
 
 
+def without_opening_lift(gcode: str, letters: tuple[str, ...] = AXIS_LETTERS) -> list[str]:
+    """The G0/G1 lines after the opening lift (§10.6), which is checked to be exactly
+    one G0 with only the two vertical axis words, before every other motion line."""
+    lines = [line for line in gcode.splitlines() if line.startswith(("G0 ", "G1 "))]
+    lift = lines[0].split()
+    assert lift[0] == "G0" and [w[0] for w in lift[1:]] == [letters[1], letters[3]], lines[0]
+    assert all(len(line.split()) >= 5 for line in lines[1:])
+    return lines[1:]
+
+
 def motion_words(gcode: str) -> list[list[str]]:
-    return [line.split() for line in gcode.splitlines() if line.startswith(("G0 ", "G1 "))]
+    return [line.split() for line in without_opening_lift(gcode)]
 
 
 def face_point(axes: tuple[float, float, float, float], y: float, span: float) -> tuple[float, float]:

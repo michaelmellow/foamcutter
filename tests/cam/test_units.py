@@ -333,6 +333,13 @@ def test_gcode_uses_only_the_documented_subset(tmp_path: Path) -> None:
         words = line.split()
         commands.append(words[0])
         assert words[0] in {"G21", "G54", "G90", "G93", "G0", "G1", "G94"}
+        if words[0] == "G0" and commands.count("G0") == 1:
+            # The opening lift (§10.6): the two vertical axes only, before any other motion.
+            assert "G1" not in commands
+            assert [w[0] for w in words[1:]] == ["Y", "A"]
+            for word in words[1:]:
+                assert re.fullmatch(r"-?\d+\.\d{4}", word[1:]), word
+            continue
         if words[0] in ("G0", "G1"):
             assert [w[0] for w in words[1:5]] == ["X", "Y", "Z", "A"]
             for word in words[1:5]:
@@ -344,13 +351,20 @@ def test_gcode_uses_only_the_documented_subset(tmp_path: Path) -> None:
             assert len(digits) >= 6
         elif words[0] == "G0":
             assert len(words) == 5
-    assert commands[:6] == ["G21", "G54", "G90", "G93", "G0", "G0"]
+    assert commands[:7] == ["G21", "G54", "G90", "G93", "G0", "G0", "G0"]  # lift, across, (across,) down
     assert commands[-2:] == ["G0", "G94"]
 
 
+def entry_line(gcode: str) -> str:
+    """The rapid to the entry point: the last G0 before the first G1."""
+    lines = gcode.splitlines()
+    first_feed = next(i for i, line in enumerate(lines) if line.startswith("G1 "))
+    return next(line for line in reversed(lines[:first_feed]) if line.startswith("G0 "))
+
+
 def test_lower_first_starts_at_the_lower_trailing_edge(tmp_path: Path) -> None:
-    upper = [line for line in run(tmp_path, wing_job()).splitlines() if line.startswith("G0")][1]
-    lower = [line for line in run(tmp_path, wing_job(direction="lower_first")).splitlines() if line.startswith("G0")][1]
+    upper = entry_line(run(tmp_path, wing_job()))
+    lower = entry_line(run(tmp_path, wing_job(direction="lower_first")))
     z = {name: float(line.split()[2][1:]) for name, line in (("upper", upper), ("lower", lower))}
     assert z["lower"] < z["upper"]
 
@@ -487,3 +501,28 @@ def test_cli_reports_errors_and_fails(tmp_path: Path, capsys: pytest.CaptureFixt
     job = write_yaml(tmp_path / "wing.yaml", wing_job(cut_speed=-1.0))
     assert main(["check", str(job), "--profile", str(SAMPLE_PROFILE)]) == 1
     assert "cut_speed: must be greater than 0" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("safe", [[550.0, 250.0, 550.0, 250.0], [400.0, 250.0, 400.0, 250.0]])
+def test_rapids_never_move_diagonally(tmp_path: Path, safe: list[float]) -> None:
+    """§10.6: lift first, then cross at the safe height, then straight down to the
+    entry point; leave straight up, then across. No rapid moves horizontal and
+    vertical axes together."""
+    gcode = run(tmp_path, wing_job(safe_position=safe))
+    lines = [line.split() for line in gcode.splitlines() if line.startswith(("G0 ", "G1 "))]
+    assert [w[0] for w in lines[0][1:]] == ["Y", "A"]  # the opening lift
+    assert lines[0][1:] == [f"Y{safe[1]:.4f}", f"A{safe[3]:.4f}"]
+    position = {"Y": safe[1], "A": safe[3]}  # horizontal axes unknown until the next line
+    previous_command = "G0"
+    for words in lines[1:]:
+        values = {w[0]: float(w[1:]) for w in words[1:] if w[0] != "F"}
+        if words[0] == "G0":
+            moved = {k for k, v in values.items() if k in position and abs(v - position[k]) > 1e-9}
+            new = {k for k in values if k not in position}
+            changed = moved | new
+            assert changed <= {"X", "Z"} or changed <= {"Y", "A"}, f"diagonal rapid: {' '.join(words)}"
+            if previous_command == "G1":
+                assert changed <= {"Y", "A"}, "the first rapid after cutting must go straight up"
+        position.update(values)
+        previous_command = words[0]
+    assert previous_command == "G0"

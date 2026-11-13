@@ -2,7 +2,7 @@
 
 Usage:
     python check.py          check everything
-    python check.py AREA     check one area only: cam, step or sim
+    python check.py AREA     check one area only: cam, step, sim or dxf
 """
 
 import argparse
@@ -16,6 +16,7 @@ AREAS = {
     "cam": ("foamcam", "tests/cam"),
     "step": ("foamstep", "tests/step"),
     "sim": ("foamsim", "tests/sim"),
+    "dxf": ("foamdxf", "tests/dxf"),
 }
 
 

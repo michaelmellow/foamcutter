@@ -1,0 +1,74 @@
+# Real machine profile. Format: docs/formats/machine-profile.md
+#
+# Filled in step by step during commissioning (owner, 2026-11-13). Every value
+# says where it came from. Values marked DRY RUN are good enough for a cold air
+# cut only; measure them before cutting foam.
+#
+# All positions are G54 work coordinates. Each axis reads 0 at its homed
+# position: homing macro, then G10 L20 P1 X0 Y0 Z0 A0. The horizontal axes home
+# at the operator's side and the vertical axes at the bottom; every reachable
+# position is positive.
+#
+# FRONT AND LEFT (machine-profile.md §3.1). The format needs +x toward the
+# "front". On this machine the horizontal axes increase AWAY from the operator,
+# so the format's front is the FAR side of the machine, and the format's left
+# and right are seen from there. Standing at the far side, facing the machine:
+#   - the tower on your left carries axes 1 and 2,
+#   - that is the Z/A tower, so axes 1-4 are Z, A, X, Y. (Confirmed by the
+#     owner, 2026-11-13: standing at the operator side, X/Y is on the left.)
+# The G-code lists the words in axis order (Z A X Y); grblHAL does not mind.
+#
+# Board as flashed (firmware/board-as-flashed.txt, 2026-11-13):
+#   grblHAL 1.1f.20260622, STM32H723, BTT SKR-3, Trinamic plugin
+#   $100-$103 = 800 steps/mm (verified by a measured move, owner 2026-11-13)
+#   $110-$113 = 3000 mm/min, $120-$123 = 50 mm/s^2, $140-$143 = 500 mA
+#   $3 = 15, $22 = 0 (homing cycle off), $376 = 0 (all axes linear)
+
+format: "foamcutter-machine-profile"
+version: 1
+name: "real machine (dry-run values)"
+
+axes:
+  - letter: "Z"        # axis 1: format-left tower (Z/A), horizontal, + = away from the operator
+    min: 0.0           # homed position (owner)
+    max: 300.0         # horizontal travel (owner)
+    max_rate: 1200.0   # owner: rapids at 3000 work; 1200 for cutting moves. <= $112
+    lead: 4.0          # from 800 steps/mm x 16 microsteps x 200 steps/rev; not seen on the screw
+  - letter: "A"        # axis 2: format-left tower (Z/A), vertical, + = up
+    min: 0.0           # homed position, bottom stop (owner)
+    max: 280.0         # vertical travel (owner)
+    max_rate: 1200.0   # <= $113
+    lead: 4.0
+  - letter: "X"        # axis 3: format-right tower (X/Y), horizontal, + = away from the operator
+    min: 0.0
+    max: 300.0
+    max_rate: 1200.0   # <= $110
+    lead: 4.0
+  - letter: "Y"        # axis 4: format-right tower (X/Y), vertical, + = up
+    min: 0.0
+    max: 280.0
+    max_rate: 1200.0   # <= $111
+    lead: 4.0
+
+wire_span: 690.0       # tower spacing (owner, 2026-11-11)
+# Squareness (§3.3): square by construction when all four axes read the same
+# (owner; assumed for the dry run, not checked with a square).
+
+# DRY RUN: the homed wire height. The wire cannot go below z = 0, so a real
+# block must sit on a riser whose top is at or above the homed wire; measure
+# that top as in machine-profile.md §3.4 and enter it here before cutting foam.
+table_z: 0.0
+
+limits:
+  max_wire_angle: 30.0   # project default
+  max_speed_ratio: 3.0   # project default
+
+kerf_tables:
+  - name: "sample-not-measured"
+    description: "SAMPLE: invented values, for cold air cuts only. Replace from the kerf test (first-cut plan, cut 1)."
+    points:
+      - { speed: 30.0,  kerf: 2.00 }
+      - { speed: 60.0,  kerf: 1.60 }
+      - { speed: 120.0, kerf: 1.10 }
+      - { speed: 240.0, kerf: 0.80 }
+      - { speed: 480.0, kerf: 0.60 }

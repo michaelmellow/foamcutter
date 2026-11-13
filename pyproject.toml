@@ -22,6 +22,10 @@ cam = [
     "PyYAML>=6",
 ]
 step = []
+dxf = [
+    "PyYAML>=6",
+    "ezdxf>=1.1",
+]
 sim = [
     "PyYAML>=6",
     "numpy>=1.26",

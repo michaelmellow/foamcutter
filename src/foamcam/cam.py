@@ -300,7 +300,15 @@ class Cam:
         entry_t = (x_entry, comp_t[start][1])
         points = [(entry_r, entry_t)] + [(comp_r[ref], comp_t[ref]) for ref in refs] + [(entry_r, entry_t)]
 
-        moves = [Move("rapid", job.safe_position), Move("rapid", self.project(entry_r, entry_t))]
+        # Rapids move one way at a time, never diagonally across the machine (§10.6):
+        # the program first lifts to the safe height (a vertical-only line written
+        # by gcode_lines), crosses at that height to the safe position, crosses to
+        # above the entry point, then goes straight down. It leaves the same way.
+        safe = job.safe_position
+        entry = self.project(entry_r, entry_t)
+        above_entry = (entry[0], safe[1], entry[2], safe[3])
+        crossing = [] if same_position(above_entry, safe) else [Move("rapid", above_entry)]
+        moves = [Move("rapid", safe), *crossing, Move("rapid", entry)]
         last = len(points) - 1
         prev_r, prev_t = points[0]
         for k in range(1, len(points)):
@@ -311,7 +319,9 @@ class Cam:
             kind = "lead_in" if k == 1 else "exit" if k == last else "cut"
             moves.append(Move(kind, self.project(r, t), max(dr, dt) / job.cut_speed, dr, dt))
             prev_r, prev_t = r, t
-        moves.append(Move("rapid", job.safe_position))
+        # Leave the same way: straight up from the entry point, then across.
+        moves += [Move("rapid", above_entry)] if crossing else []
+        moves.append(Move("rapid", safe))
 
         self.check_rapids(moves)
         if job.mirror:
@@ -350,6 +360,11 @@ class Cam:
             program.add(comment(text))
         for code in ("G21", "G54", "G90", "G93"):
             program.add(code)
+        # §10.6: lift both vertical axes to the safe height where the wire is,
+        # before any horizontal move. Only the vertical axis words: the program
+        # does not know where the horizontal axes are when it starts.
+        safe = moves[0].axes
+        program.add(f"G0 {profile.letters[1]}{axis_value(safe[1])} {profile.letters[3]}{axis_value(safe[3])}")
         previous_words = ""
         carried = 0.0  # minutes of G1 lines dropped since the last one written
         for index, move in enumerate(moves):
@@ -418,9 +433,13 @@ class Cam:
         self.problems += found.values()
 
     def check_rapids(self, moves: list[Move]) -> None:
-        """§10.6: the rapids between the safe position and the entry point stay clear of the block."""
-        for a, b, what in ((moves[0], moves[1], "to the entry point"), (moves[-2], moves[-1], "back to the safe position")):
-            if self.rapid_hits_block(a.axes, b.axes):
+        """§10.6: every rapid between the safe position and the entry point stays clear of the block."""
+        first_feed = next(i for i, m in enumerate(moves) if m.kind != "rapid")
+        last_feed = max(i for i, m in enumerate(moves) if m.kind != "rapid")
+        # (first, last) index of the moves whose rapid to the next move is checked
+        legs = ((0, first_feed - 2, "to the entry point"), (last_feed, len(moves) - 2, "back to the safe position"))
+        for first, last, what in legs:
+            if any(self.rapid_hits_block(moves[i].axes, moves[i + 1].axes) for i in range(first, last + 1)):
                 self.problems.append(f"the rapid move {what} passes through the foam block")
 
     def rapid_hits_block(self, start: Axes, end: Axes) -> bool:
@@ -434,6 +453,10 @@ class Cam:
             if segment_hits_box(p0, p1, (block.x, z0), (block.x + block.length, z0 + block.height)):
                 return True
         return False
+
+
+def same_position(a: Axes, b: Axes) -> bool:
+    return max(abs(p - q) for p, q in zip(a, b)) < 1e-9
 
 
 class Program:
