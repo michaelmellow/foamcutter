@@ -50,10 +50,13 @@ method the director approved in three rounds of decisions (below).
    - **Dropped lines.** A `G1` line whose four axis words equal the previous
      line's after rounding is dropped, and its time is added to the next line.
      Before, the time was lost.
-   - **Kerf table range.** A lookup outside the kerf table, in any round, is
-     recorded with the exact message of machine-profile §7. The nearer table
-     end is used only so that the other checks can run and be reported in the
-     same run. No program is written.
+   - **Kerf table range.** Only the settled lookup counts. During the
+     iteration a speed outside the table takes the nearer table end. If the
+     settled lookup is outside the table, it is recorded with the exact message
+     of machine-profile §7, the nearer table end is used only so that the other
+     checks can run and be reported in the same run, and no program is written.
+     (Changed after review, director's answer to open question 2: at first,
+     any round counted.)
 
 ### Code (`src/foamcam/`)
 
@@ -88,7 +91,11 @@ method the director approved in three rounds of decisions (below).
   - an out-of-table speed reported with the exact §7 message together with a
     soft-limit error;
   - no files written by `cut` when a lookup is out of range;
-  - the 10-round error (forced by limiting the rounds to 1).
+  - the 10-round error (forced by limiting the rounds to 1);
+  - only the settled lookup counts: with a constant 1 mm kerf the slowest
+    stretch runs at 90.49 mm/min on the target contour and 91.06 mm/min
+    settled. A table from 90.8 mm/min is cut; a table from 91.2 mm/min is
+    refused with the §7 message.
 - **Changed existing tests:**
   - `test_tapered_projection_matches_hand_calculation`: the single P2 line is
     replaced by two lines, (49.9, 9.8336, 199.9, 70.0329) where the root
@@ -161,7 +168,9 @@ spar hole is 10 × 6 mm at both sections, so its speed ratio is 1.
 - **§11:** new paragraph: a `G1` line equal to the previous line after
   rounding is not written, and its time is added to the next `G1` line.
 - **§11.1:** new bullet **Kerf table range**, with the director's three
-  conditions.
+  conditions. After review it says that only the settled lookup counts, and
+  that during the iteration an out-of-range speed takes the nearer table end
+  and the iteration carries on.
 
 No other section was changed. §13 is unchanged: it defines the form of the
 lines written, not which moves become lines, so the dropped-line rule is
@@ -169,7 +178,7 @@ stated in §11, where the timing is.
 
 ## 2. What was verified, and how
 
-- `python check.py cam` passes: ruff, strict mypy and 57 tests. Run on macOS
+- `python check.py cam` passes: ruff, strict mypy and 59 tests. Run on macOS
   with Python 3.14.7 (project `.venv`).
 - Both new tests failed on the old code first:
   - (a): 0.1072 mm (straight-wing), 0.1437 mm (tapered-spar) and 0.0494 mm
@@ -233,15 +242,9 @@ stated in §11, where the timing is.
      1%-axis-scaling tests fail. These need the Brief 5 owner to look, and may
      show a remaining CAM error. I'll fix it if one is found.
    - Until then `main` would fail CI if this branch is merged as it is.
-2. **Strictness of the out-of-range rule.** Following condition 3 literally,
-   a lookup that is out of range in any round, including the first one
-   (uncompensated speeds), refuses the job, even if the settled speeds would be
-   inside the table. Is that intended, or should only the settled lookup
-   count?
-3. **Very short moves.** Is a shortest move of about 0.002 mm acceptable on
-   the machine, or should the merge gap (0.001 mm, director's rule 4) be tied
-   to the motor step size once commissioning fixes the microstep setting?
-4. **Kerf at the trailing-edge face.** The TE face has its own kerf (root
-   1.07 to 1.09 mm on the tapered examples, where the rest of the root is
-   1.025). This follows from the rule. It is noted here because the TE face
-   is short and its speed ratio differs a lot from the surfaces next to it.
+2. **Strictness of the out-of-range rule.** Answered: only the settled
+   lookup counts. Implemented, §11.1 updated, tested.
+3. **Very short moves.** Answered: keep the 0.001 mm merge gap for now; to be
+   revisited after the firmware bench test.
+4. **Kerf at the trailing-edge face.** Answered: accepted, as it follows
+   from the rule.

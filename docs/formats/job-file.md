@@ -539,11 +539,13 @@ any of these fails:
   (§10.5), the speed ratio at the foam faces is at most `max_speed_ratio`.
 - **Axis rate.** For every feed move, each axis's speed `|Δa| / T` is at most
   that axis's `max_rate`.
-- **Kerf table range.** If any kerf lookup of §10.7, in any round, falls
-  outside the kerf table, the error has the exact message of machine
-  profile §7, and no program is written. So that the other checks can be
-  reported in the same run, the CAM continues with the kerf at the nearer end
-  of the table. That value is used only to let the other checks run.
+- **Kerf table range.** Only the settled lookup of §10.7 step 6 counts.
+  During the iteration, a speed outside the kerf table takes the kerf at the
+  nearer end of the table, and the iteration carries on. If a speed of the
+  settled lookup is outside the table, the error has the exact message of
+  machine profile §7, and no program is written. So that the other checks
+  can be reported in the same run, the CAM continues with the nearer-end kerf;
+  that value is used only to let the other checks run.
 
 Nothing is clipped or adjusted to make a check pass.
 

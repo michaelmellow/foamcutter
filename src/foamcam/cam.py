@@ -192,12 +192,12 @@ class Cam:
                 self.offset_face(self.tip, poly_t, edge_halves(groups_t, half_t, len(poly_t)), outward, where),
             )
 
-        # Every lookup outside the kerf table, from any round, stops the program.
-        out_of_table: list[str] = []
-        # First lookup from the speeds of the uncompensated path.
-        half_r, half_t = self.group_halves(poly_r, poly_t, groups_r, groups_t, out_of_table)
+        # First lookup from the speeds of the uncompensated path. During the
+        # iteration a speed outside the kerf table takes the nearer table end.
+        half_r, half_t = self.group_halves(poly_r, poly_t, groups_r, groups_t, [])
         for rounds in range(1, KERF_ROUNDS + 1):
             new_r, new_t = offsets(half_r, half_t)
+            out_of_table: list[str] = []  # only the settled lookup counts
             next_r, next_t = self.group_halves(new_r, new_t, groups_r, groups_t, out_of_table)
             change = max(abs(a - b) for a, b in zip(half_r + half_t, next_r + next_t))
             if change <= KERF_SETTLED:
@@ -210,9 +210,9 @@ class Cam:
             )
         self.kerf_rounds[where] = rounds
         if out_of_table:
-            # Reported with the other checks; the program is not written. The
-            # last message has the speed nearest to the real one.
-            self.problems.append(out_of_table[-1])
+            # The settled lookup is outside the table: reported with the other
+            # checks, and the program is not written.
+            self.problems.append(out_of_table[0])
         for label, half in (("root", half_r), ("tip", half_t)):
             self.kerf_used[label] += [2 * h for h in half if h > 0]
         return new_r, new_t, half_r, half_t

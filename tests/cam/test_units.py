@@ -216,6 +216,26 @@ def test_out_of_table_speed_is_reported_with_the_other_checks(tmp_path: Path) ->
     assert any(p.startswith("axis 4 (A) goes to") for p in problems), problems
 
 
+@pytest.mark.parametrize(("table_start", "refused"), [(90.8, False), (91.2, True)])
+def test_only_the_settled_kerf_lookup_must_be_inside_the_table(
+    tmp_path: Path, table_start: float, refused: bool
+) -> None:
+    """§11.1: with a constant kerf of 1 mm, the slowest stretch of this job runs at
+    90.49 mm/min on the target contour and 91.06 mm/min on the settled offset contour.
+    A table from 90.8 is out of range only in the first lookup and the job is cut; a
+    table from 91.2 is out of range in the settled lookup and the job is refused."""
+    profile = sample_profile_data()
+    profile["kerf_tables"] = [{"name": "eps-20-sample", "description": "",
+                               "points": [{"speed": table_start, "kerf": 1.0}, {"speed": 1000.0, "kerf": 1.0}]}]
+    if refused:
+        with pytest.raises(CamError) as caught:
+            run(tmp_path, wing_job(), profile)
+        pattern = r'kerf table "eps-20-sample": speed 91\.1 mm/min is outside the table range 91\.2 to 1000 mm/min'
+        assert [p for p in caught.value.problems if re.fullmatch(pattern, p)], caught.value.problems
+    else:
+        assert run(tmp_path, wing_job(), profile).count("\nG1 ") > 100
+
+
 def test_out_of_table_speed_writes_no_program(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     job = write_yaml(tmp_path / "wing.yaml", wing_job(cut_speed=600.0))
     out = tmp_path / "out"
