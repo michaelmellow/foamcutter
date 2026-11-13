@@ -26,6 +26,11 @@ dxf = [
     "PyYAML>=6",
     "ezdxf>=1.1",
 ]
+# Optional: STEP models in the DXF front end (foamdxf.step). tests/dxf/test_step.py
+# is skipped when gmsh is not installed or cannot load.
+dxf-step = [
+    "gmsh>=4.11",
+]
 sim = [
     "PyYAML>=6",
     "numpy>=1.26",

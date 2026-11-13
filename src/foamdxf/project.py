@@ -1,7 +1,7 @@
 """Slicer projects: every form value plus a copy of each input file, in one file.
 
 A project (`.foamproj`, JSON) records the values exactly as typed and, for the
-root DXF, the tip DXF and the machine profile, the original path, a SHA-256
+root DXF, the tip DXF, the machine profile and the STEP model, the original path, a SHA-256
 and the file's bytes (base64). Opening a project uses the original file when
 it is still there and unchanged. Otherwise the saved copy is written to a
 folder next to the project (`<project name>_files/`) and used instead, so a
@@ -21,7 +21,7 @@ from .errors import DxfError
 FORMAT = "foamdxf-project"
 VERSION = 1
 SUFFIX = ".foamproj"
-FILE_KEYS = ("root", "tip", "profile")
+FILE_KEYS = ("root", "tip", "profile", "step")
 
 
 @dataclass(frozen=True)

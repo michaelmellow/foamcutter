@@ -200,3 +200,39 @@ otherwise check what they checked before. `examples/gcode/*.nc` regenerated as
   four axes, so it will reject the opening lift once its `table_z` failure is
   fixed. It needs to accept a first `G0` with only axes 2 and 4 (no cut happens
   before the first full position).
+
+## 6. STEP models as an alternative to two DXFs (owner's request)
+
+The DXF workflow is unchanged. As a second source, the window (Files > Source:
+STEP model) and the CLI (`--step MODEL [--faces ROOT,TIP] [--list-faces]`) take
+a STEP model whose root and tip are **flat end faces**:
+
+- `src/foamdxf/step.py` reads the model with gmsh (OpenCASCADE, `pip install
+  gmsh`, optional group `dxf-step`) and lists every flat face. The suggested
+  pair is the parallel flat faces farthest apart (weighted by the smaller
+  face's area); the larger is the root. The operator can pick any two.
+- The span is the distance between the two faces; the span field becomes
+  read-only and shows it.
+- Both faces are mapped into one 2D frame: x along the root chord with the
+  leading edge (the thicker end) at the smaller x, z up, the model moved
+  rigidly (never mirrored), so sweep, dihedral and twist come from the model.
+  If the upper side would face down with the picked root at the axes 1-2
+  tower, the model is turned over (180° about the chord) and the root is cut at
+  the axes 3-4 tower instead; a warning says so. Which happens depends only on
+  the wing's hand.
+- The outline steps after that (joining, Selig order, trailing-edge handling,
+  simplify) are the DXF ones (`outline.outline_from_pieces`).
+- Projects store the STEP file like the DXFs (`project.FILE_KEYS`).
+
+Not covered: wings without flat end faces (rounded tips), sections cut at
+arbitrary stations, panel splitting and deviation reports. Those are Brief 4
+(`src/foamstep`), which this does not replace.
+
+Tests: `tests/dxf/test_step.py` builds NACA 2412 wings with gmsh in code and
+checks chords, sweep, span, rigidity (handedness and distances) in four
+placements, bad face choices, the CLI, the window and project restore. Skipped
+when gmsh is not installed.
+
+Also in this change: the Section tab's horizontal axis is inverted (+x, away
+from the operator, runs right to left, as seen from the X/Y side). The 3D tab
+is unchanged.

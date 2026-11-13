@@ -1,7 +1,8 @@
 """Desktop window for the DXF front end: python -m foamdxf --gui [PROJECT.foamproj]
 
 Pick the root and tip DXFs and the machine profile, enter the span and stock
-size, press Preview to see the cut, then Generate to write the job, G-code,
+size (or pick a STEP model and its root and tip faces: the span is then
+measured from the model), press Preview to see the cut, then Generate to write the job, G-code,
 report and SVG. File > Save project keeps every value and a copy of each input
 file in one .foamproj file (see project.py). Uses Tkinter only (part of Python), so it needs no extra
 packages. The last values are remembered in ~/.foamdxf-gui.json.
@@ -11,6 +12,7 @@ import functools
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tkinter as tk
@@ -32,13 +34,16 @@ from .pipeline import (
     Request,
     alignment_edges,
     make_job,
+    outline_size,
     preview_geometry,
+    read_outlines,
     run_cam,
     write_files,
 )
 from .project import SUFFIX
 from .project import open_project as read_project
 from .project import save_project as write_project
+from .step import StepModel, read_step, sections
 from .view3d import View3D
 
 REPO = Path(__file__).resolve().parents[2]
@@ -53,8 +58,11 @@ FILE_FIELDS = [
 PART_FIELDS = [
     ("span", "Span (root to tip)", "400", "mm"),
     ("stock_length", "Stock length (chord)", "220", "mm"),
+    ("margin_length", "   or margin each side", "", "mm past the outlines"),
     ("stock_height", "Stock height", "40", "mm"),
+    ("margin_height", "   or margin each side", "", "mm past the outlines"),
 ]
+MARGINS = {"stock_length": "margin_length", "stock_height": "margin_height"}  # stock = outlines + 2 * margin
 CUT_FIELDS = [
     ("speed", "Cut speed", "150", "mm/min"),
     ("lead_in", "Lead-in", "20", "mm"),
@@ -66,6 +74,11 @@ CUT_FIELDS = [
 ]
 DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
+# STEP workflow: source "step" uses the model and two of its flat faces (numbers) instead of the DXFs
+DEFAULTS |= {"source": "dxf", "step": "", "root_face": "", "tip_face": ""}
+# which stock values were typed last ("absolute" or "margin"): kept when the outlines change
+DEFAULTS |= {"stock_mode": "absolute"}
+STEP_LABELS = {"step": "STEP model", "root_face": "Root face", "tip_face": "Tip face"}
 
 COLOURS = {
     "travel": "#9aa0a6",
@@ -108,13 +121,25 @@ def request_from_form(values: dict[str, str]) -> Request:
         assert n is not None
         return n
 
-    labels = {key: label for key, label, _, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
-    paths = {key: Path(text(key, labels[key])) for key in ("root", "tip", "profile")}
+    labels = {key: label for key, label, _, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS} | STEP_LABELS
+    step = values.get("source", "dxf") == "step"
+    keys = ("step", "profile") if step else ("root", "tip", "profile")
+    paths = {key: Path(text(key, labels[key])) for key in keys}
     for key, path in paths.items():
         if not path.is_file():
             raise FormError(f"{labels[key]}: file not found ({path})")
+    faces: tuple[int, int] | None = None
+    if step:
+        tags = []
+        for key in ("root_face", "tip_face"):
+            try:
+                tags.append(int(text(key, labels[key])))
+            except ValueError:
+                raise FormError(f"{labels[key]}: pick a face of the model") from None
+        faces = (tags[0], tags[1])
+        paths["root"] = paths["tip"] = paths["step"]
     placement = Placement(
-        span=req("span", labels["span"]),
+        span=0.0 if step else req("span", labels["span"]),  # STEP: measured between the faces
         stock_length=req("stock_length", labels["stock_length"]),
         stock_height=req("stock_height", labels["stock_height"]),
         block_x=number("block_x", labels["block_x"], optional=True),
@@ -136,7 +161,15 @@ def request_from_form(values: dict[str, str]) -> Request:
         settings=settings,
         name=values.get("name", "").strip() or None,
         simplify=req("simplify", labels["simplify"]),
+        faces=faces,
     )
+
+
+def _number(text: str) -> float | None:
+    try:
+        return float(text.strip().replace(",", "."))
+    except ValueError:
+        return None
 
 
 def load_settings() -> dict[str, str]:
@@ -168,6 +201,11 @@ class SlicerWindow:
         self.geometry: PreviewGeometry | None = None
         self.project_path: Path | None = None
         self.saved_values: dict[str, str] = {}
+        self.step_model: StepModel | None = None
+        self._step_pending = False
+        self.outlines: tuple[float, float] | None = None  # length, height of the box around both outlines
+        self._size_pending = False
+        self._syncing = False
 
         self.status = tk.StringVar(value="Pick the two DXFs, then press Preview.")
         ttk.Label(root, textvariable=self.status, anchor="w", padding=(8, 3), relief="sunken").pack(
@@ -184,6 +222,16 @@ class SlicerWindow:
         self._build_right(right)
         self.vars["profile"].trace_add("write", lambda *_: self._load_kerf_tables())
         self._load_kerf_tables()
+        for key in ("source", "step"):
+            self.vars[key].trace_add("write", lambda *_: self._queue_step_load())
+        self._source_changed()
+        self._load_step()
+        for stock, margin in MARGINS.items():
+            self.vars[stock].trace_add("write", functools.partial(self._stock_edited, stock))
+            self.vars[margin].trace_add("write", functools.partial(self._margin_edited, stock))
+        for key in ("source", "root", "tip", "step", "root_face", "tip_face", "simplify"):
+            self.vars[key].trace_add("write", lambda *_: self._queue_size_update())
+        self._update_size()
         self.saved_values = self.values()
         for var in self.vars.values():
             var.trace_add("write", lambda *_: self._update_title())
@@ -227,9 +275,16 @@ class SlicerWindow:
         return self.save_project() if answer else True
 
     def load_values(self, values: dict[str, str]) -> None:
-        for key, var in self.vars.items():
-            var.set(values.get(key, DEFAULTS.get(key, "")))
+        self._syncing = True  # the values belong together; do not sync them one by one
+        try:
+            for key, var in self.vars.items():
+                var.set(values.get(key, DEFAULTS.get(key, "")))
+        finally:
+            self._syncing = False
         self._load_kerf_tables()  # a blank or unknown kerf table becomes the profile's first
+        self._source_changed()
+        self._load_step()
+        self._update_size()
         self.plan = self.result = self.geometry = None
         self.draw()
         self.view3d.show(None)
@@ -284,7 +339,8 @@ class SlicerWindow:
         return True
 
     def save_project_as(self) -> bool:
-        stem = Path(self.vars["root"].get()).stem or "project"
+        source = "step" if self.vars["source"].get() == "step" else "root"
+        stem = Path(self.vars[source].get()).stem or "project"
         chosen = filedialog.asksaveasfilename(
             parent=self.root, defaultextension=SUFFIX, initialfile=f"{stem}{SUFFIX}",
             filetypes=[("Slicer project", f"*{SUFFIX}")])
@@ -298,15 +354,53 @@ class SlicerWindow:
     def _build_form(self, form: ttk.Frame) -> None:
         files = ttk.LabelFrame(form, text="Files", padding=6)
         files.pack(fill=tk.X)
-        for row, (key, label, _, kind) in enumerate(FILE_FIELDS):
-            ttk.Label(files, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(files, textvariable=self.vars[key], width=34).grid(row=row, column=1, sticky="we", padx=4)
-            ttk.Button(files, text="…", width=3, command=self._browse(key, kind)).grid(row=row, column=2)
+        choice = ttk.Frame(files)
+        choice.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        ttk.Label(choice, text="Source").pack(side=tk.LEFT, padx=(0, 8))
+        for value, text in (("dxf", "Two DXFs"), ("step", "STEP model")):
+            ttk.Radiobutton(choice, text=text, value=value, variable=self.vars["source"],
+                            command=self._source_changed).pack(side=tk.LEFT, padx=(0, 8))
+        self.mode_rows: dict[str, list[tk.Widget]] = {"dxf": [], "step": []}
+        rows = [(key, label, kind, "dxf") for key, label, _, kind in FILE_FIELDS[:2]]
+        rows += [("step", "STEP model", "step", "step")]
+        rows += [(key, label, kind, "all") for key, label, _, kind in FILE_FIELDS[2:]]
+        self.face_text: dict[str, tk.StringVar] = {}
+        self.face_boxes: dict[str, ttk.Combobox] = {}
+        row = 1
+        for key, label, kind, mode in rows:
+            widgets: list[tk.Widget] = [
+                ttk.Label(files, text=label),
+                ttk.Entry(files, textvariable=self.vars[key], width=34),
+                ttk.Button(files, text="…", width=3, command=self._browse(key, kind)),
+            ]
+            widgets[0].grid(row=row, column=0, sticky="w", pady=2)
+            widgets[1].grid(row=row, column=1, sticky="we", padx=4)
+            widgets[2].grid(row=row, column=2)
+            row += 1
+            if mode != "all":
+                self.mode_rows[mode] += widgets
+            if key == "step":  # the two face pickers go right under the model
+                for face_key in ("root_face", "tip_face"):
+                    text_var = tk.StringVar()
+                    box = ttk.Combobox(files, textvariable=text_var, state="readonly", width=34)
+                    box.bind("<<ComboboxSelected>>", functools.partial(self._face_picked, face_key))
+                    name = ttk.Label(files, text=STEP_LABELS[face_key])
+                    name.grid(row=row, column=0, sticky="w", pady=2)
+                    box.grid(row=row, column=1, columnspan=2, sticky="we", padx=4)
+                    row += 1
+                    self.face_text[face_key], self.face_boxes[face_key] = text_var, box
+                    self.mode_rows["step"] += [name, box]
+                self.span_note = ttk.Label(files, text="", foreground="#5f6368", wraplength=330, justify="left")
+                self.span_note.grid(row=row, column=0, columnspan=3, sticky="w")
+                row += 1
+                self.mode_rows["step"].append(self.span_note)
         files.columnconfigure(1, weight=1)
 
         part = ttk.LabelFrame(form, text="Part and stock", padding=6)
         part.pack(fill=tk.X, pady=(8, 0))
         self._number_rows(part, PART_FIELDS)
+        self.size_note = ttk.Label(part, text="", foreground="#5f6368", wraplength=330, justify="left")
+        self.size_note.grid(row=len(PART_FIELDS), column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         cut = ttk.LabelFrame(form, text="Cut", padding=6)
         cut.pack(fill=tk.X, pady=(8, 0))
@@ -340,8 +434,154 @@ class SlicerWindow:
         for i, (key, label, _, unit) in enumerate(fields):
             row = first_row + i
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(parent, textvariable=self.vars[key], width=10).grid(row=row, column=1, sticky="w", padx=4)
+            entry = ttk.Entry(parent, textvariable=self.vars[key], width=10)
+            entry.grid(row=row, column=1, sticky="w", padx=4)
             ttk.Label(parent, text=unit, foreground="#5f6368").grid(row=row, column=2, sticky="w")
+            if key == "span":
+                self.span_entry = entry
+
+    # --- stock size: absolute or as a margin around the outlines ---------------------------
+
+    def _queue_size_update(self) -> None:
+        if not self._size_pending:
+            self._size_pending = True
+            self.root.after_idle(self._update_size)
+
+    def _update_size(self) -> None:
+        """Measure the outlines, then fill whichever stock values were not typed last."""
+        self._size_pending = False
+        self.outlines = None
+        v = self.values()
+        simplify = _number(v["simplify"])
+        try:
+            if v["source"] == "step":
+                faces = (int(v["root_face"]), int(v["tip_face"]))
+                root_path = tip_path = Path(v["step"].strip())
+            else:
+                faces = None
+                root_path, tip_path = Path(v["root"].strip()), Path(v["tip"].strip())
+            if not (root_path.is_file() and tip_path.is_file()):
+                raise DxfError("files missing")
+            root, tip, _, _ = read_outlines(root_path, tip_path, faces, 0.01 if simplify is None else simplify)
+            self.outlines = outline_size(root, tip)
+        except (DxfError, ValueError, OSError):
+            self.size_note.configure(text="Margins need the outlines: pick the files first.")
+            return
+        length, height = self.outlines
+        self.size_note.configure(text=f"Outlines {length:.1f} x {height:.1f} mm (length x height), "
+                                      "centred in the stock. Leave room for the kerf.")
+        for stock in MARGINS:
+            if self.vars["stock_mode"].get() == "margin":
+                self._margin_edited(stock, keep_mode=True)
+            else:
+                self._stock_edited(stock, keep_mode=True)
+
+    def _size_of(self, stock: str) -> float | None:
+        if self.outlines is None:
+            return None
+        return self.outlines[0] if stock == "stock_length" else self.outlines[1]
+
+    def _stock_edited(self, stock: str, *_: object, keep_mode: bool = False) -> None:
+        if self._syncing:
+            return
+        size, value = self._size_of(stock), _number(self.vars[stock].get())
+        if not keep_mode:
+            self.vars["stock_mode"].set("absolute")
+        if size is None or value is None:
+            return
+        self._set_quietly(MARGINS[stock], (value - size) / 2)
+
+    def _margin_edited(self, stock: str, *_: object, keep_mode: bool = False) -> None:
+        if self._syncing:
+            return
+        size, margin = self._size_of(stock), _number(self.vars[MARGINS[stock]].get())
+        if not keep_mode:
+            self.vars["stock_mode"].set("margin")
+        if size is None or margin is None:
+            return
+        self._set_quietly(stock, size + 2 * margin)
+
+    def _set_quietly(self, key: str, value: float) -> None:
+        self._syncing = True
+        try:
+            self.vars[key].set(f"{value:.2f}".rstrip("0").rstrip("."))
+        finally:
+            self._syncing = False
+
+    # --- STEP models ----------------------------------------------------------------------
+
+    def _source_changed(self) -> None:
+        """Show the DXF rows or the STEP rows. With a STEP model the span is measured, not typed."""
+        mode = "step" if self.vars["source"].get() == "step" else "dxf"
+        for name, widgets in self.mode_rows.items():
+            for w in widgets:
+                if name == mode:
+                    w.grid()
+                else:
+                    w.grid_remove()
+        self.span_entry.configure(state="readonly" if mode == "step" else "normal")
+
+    def _queue_step_load(self) -> None:
+        if not self._step_pending:  # several fields may change at once (load_values)
+            self._step_pending = True
+            self.root.after_idle(self._load_step)
+
+    def _load_step(self) -> None:
+        """Read the STEP model, list its flat faces and keep (or suggest) the root and tip."""
+        self._step_pending = False
+        self.step_model = None
+        for key, box in self.face_boxes.items():
+            box.configure(values=())
+            self.face_text[key].set("")
+        self.span_note.configure(text="")
+        name = self.vars["step"].get().strip()
+        if self.vars["source"].get() != "step" or not name or not Path(name).is_file():
+            return
+        self.root.configure(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            model = read_step(Path(name))
+        except DxfError as error:
+            self.span_note.configure(text=str(error), foreground="#b3261e")
+            self.status.set("Error: " + str(error))
+            return
+        finally:
+            self.root.configure(cursor="")
+        self.step_model = model
+        tags = {f.tag for f in model.faces}
+        chosen = [self.vars[k].get().strip() for k in ("root_face", "tip_face")]
+        if not all(c.isdigit() and int(c) in tags for c in chosen) or chosen[0] == chosen[1]:
+            pair = model.suggest() or (model.faces[0].tag, model.faces[0].tag)
+            self.vars["root_face"].set(str(pair[0]))
+            self.vars["tip_face"].set(str(pair[1]))
+        labels = [f.label() for f in model.faces]
+        for key, box in self.face_boxes.items():
+            box.configure(values=labels)
+            self.face_text[key].set(model.face(int(self.vars[key].get())).label())
+        self._measure_span()
+
+    def _face_picked(self, key: str, _event: object = None) -> None:
+        found = re.match(r"face (\d+):", self.face_text[key].get())
+        if found:
+            self.vars[key].set(found.group(1))
+            self._measure_span()
+
+    def _measure_span(self) -> None:
+        """Put the distance between the picked faces in the span field."""
+        model = self.step_model
+        if model is None:
+            return
+        try:
+            cut = sections(model, int(self.vars["root_face"].get()), int(self.vars["tip_face"].get()), 0.0)
+        except (DxfError, ValueError) as error:
+            self.span_note.configure(text=str(error), foreground="#b3261e")
+            return
+        self.vars["span"].set(f"{cut.span:.3f}".rstrip("0").rstrip("."))
+        note = (f"Span {cut.span:.3f} mm, measured between the faces. "
+                f"Chords {cut.root.chord:.1f} and {cut.tip.chord:.1f} mm.")
+        if cut.warnings and "turned over" in cut.warnings[0]:
+            note += " " + cut.warnings[0].split(": ", 1)[1].capitalize() + "."
+        self.span_note.configure(text=note, foreground="#5f6368")
 
     def _build_right(self, right: ttk.Frame) -> None:
         tabs = ttk.Notebook(right)
@@ -488,7 +728,10 @@ class SlicerWindow:
             if kind == "dir":
                 chosen = filedialog.askdirectory(initialdir=start)
             else:
-                types = [("DXF drawing", "*.dxf")] if kind == "dxf" else [("Machine profile", "*.yaml")]
+                types = {
+                    "dxf": [("DXF drawing", "*.dxf")],
+                    "step": [("STEP model", "*.step *.stp")],
+                }.get(kind, [("Machine profile", "*.yaml")])
                 chosen = filedialog.askopenfilename(initialdir=start, filetypes=types + [("All files", "*.*")])
             if chosen:
                 self.vars[key].set(chosen)
@@ -618,7 +861,10 @@ class SlicerWindow:
     # --- drawing --------------------------------------------------------------------------
 
     def _transform(self) -> tuple[float, float, float, float] | None:
-        """(scale, x offset, y offset, world y max) to fit the travel area in the canvas."""
+        """(scale, x offset, y offset, world y max) to fit the travel area in the canvas.
+
+        The horizontal axis is inverted: +x (away from the operator) runs to the
+        left, as seen from the X/Y side of the machine. Canvas x = ox - scale * x."""
         g = self.geometry
         if g is None:
             return None
@@ -628,7 +874,7 @@ class SlicerWindow:
         x0, z0, x1, z1 = g.travel
         margin = 40
         scale = min((w - 2 * margin) / max(x1 - x0, 1e-6), (h - 2 * margin - 60) / max(z1 - z0, 1e-6))
-        ox = (w - scale * (x1 - x0)) / 2 - scale * x0
+        ox = (w + scale * (x1 - x0)) / 2 + scale * x0
         oy = (h - scale * (z1 - z0)) / 2 + 30 + scale * z1
         return scale, ox, oy, z1
 
@@ -638,7 +884,7 @@ class SlicerWindow:
         scale, ox, oy, _ = t
         out: list[float] = []
         for x, z in points:
-            out += [ox + scale * x, oy - scale * z]
+            out += [ox - scale * x, oy - scale * z]
         return out
 
     def draw(self) -> None:
@@ -661,13 +907,13 @@ class SlicerWindow:
         for target in (g.root_target, g.tip_target):
             c.create_line(*self._to_canvas(target + target[:1]), fill=COLOURS["target"], width=1)
 
-        # axis labels at the travel corners
-        bl = self._to_canvas([(x0, z0)])
-        tr = self._to_canvas([(x1, z1)])
-        c.create_text(bl[0], bl[1] + 12, text=f"x {x0:g}", anchor="w", fill="#5f6368")
-        c.create_text(tr[0], bl[1] + 12, text=f"x {x1:g}  (+x away from operator)", anchor="e", fill="#5f6368")
-        c.create_text(bl[0] - 6, tr[1], text=f"z {z1:g}", anchor="e", fill="#5f6368")
-        c.create_text(bl[0] - 6, bl[1], text=f"z {z0:g}", anchor="e", fill="#5f6368")
+        # axis labels at the travel corners (x runs right to left)
+        br = self._to_canvas([(x0, z0)])
+        tl = self._to_canvas([(x1, z1)])
+        c.create_text(br[0], br[1] + 12, text=f"x {x0:g}", anchor="e", fill="#5f6368")
+        c.create_text(tl[0], br[1] + 12, text=f"x {x1:g}  (<- +x away from operator)", anchor="w", fill="#5f6368")
+        c.create_text(br[0] + 6, tl[1], text=f"z {z1:g}", anchor="w", fill="#5f6368")
+        c.create_text(br[0] + 6, br[1], text=f"z {z0:g}", anchor="w", fill="#5f6368")
 
         legend = [
             (COLOURS["root"], None, 2, "wire at root face (kerf compensated)"),
@@ -688,7 +934,7 @@ class SlicerWindow:
         if t is None:
             return
         scale, ox, oy, _ = t
-        x, z = (event.x - ox) / scale, (oy - event.y) / scale
+        x, z = (ox - event.x) / scale, (oy - event.y) / scale
         if self.result is not None:
             self.status.set(f"x {x:7.1f}  z {z:7.1f} mm      cut time {self.result.total_time:.2f} min")
 

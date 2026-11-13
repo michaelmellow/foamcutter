@@ -167,3 +167,28 @@ def test_align_tab_copies_and_shows_an_edge(window: SlicerWindow, tmp_path: Path
     assert window.view3d.highlight == (edge.x, edge.z, edge.name)
     window.preview()  # a new preview clears the highlight
     assert window.view3d.highlight is None
+
+
+def test_stock_margins_follow_the_absolute_values(window: SlicerWindow) -> None:
+    window.load_values(form(stock_length="220", stock_height="40", stock_mode="absolute"))
+    assert window.outlines is not None
+    length, height = window.outlines
+    assert float(window.vars["margin_length"].get()) == pytest.approx((220 - length) / 2, abs=0.01)
+    assert float(window.vars["margin_height"].get()) == pytest.approx((40 - height) / 2, abs=0.01)
+
+    window.vars["margin_length"].set("5")  # typing a margin sets the stock
+    assert float(window.vars["stock_length"].get()) == pytest.approx(length + 10, abs=0.01)
+    assert window.vars["stock_mode"].get() == "margin"
+    window.vars["stock_height"].set("50")  # typing the stock sets the margin
+    assert float(window.vars["margin_height"].get()) == pytest.approx((50 - height) / 2, abs=0.01)
+    assert window.vars["stock_mode"].get() == "absolute"
+
+    # new outlines keep whatever was typed last: here the margins
+    window.vars["margin_height"].set("3")
+    window.vars["root"].set(str(TIP_DXF))  # tip twice: a smaller box than root + tip
+    window._update_size()
+    assert window.outlines is not None and window.outlines != (length, height)
+    new_length, new_height = window.outlines
+    assert float(window.vars["stock_length"].get()) == pytest.approx(new_length + 10, abs=0.01)
+    assert float(window.vars["stock_height"].get()) == pytest.approx(new_height + 6, abs=0.01)
+    assert window.preview()

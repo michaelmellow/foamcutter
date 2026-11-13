@@ -108,6 +108,8 @@ def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SlicerWi
 
 def test_window_saves_and_reopens_a_project(window: SlicerWindow, tmp_path: Path, inputs: dict[str, str]) -> None:
     window.load_values(inputs)
+    loaded = window.values()  # inputs plus the margins measured from the outlines
+    assert loaded == inputs | {"margin_length": "20", "margin_height": "9.05"}
     window.project_path = tmp_path / "wing.foamproj"
     assert window.save_project()
     assert not window.modified() and window.root.title().startswith("wing.foamproj -")
@@ -118,7 +120,7 @@ def test_window_saves_and_reopens_a_project(window: SlicerWindow, tmp_path: Path
     window.new_project()
     assert window.vars["root"].get() == ""
     assert window.open_project(tmp_path / "wing.foamproj")
-    assert window.values() == inputs
+    assert window.values() == loaded
     assert window.geometry is not None  # opening runs the preview
 
 

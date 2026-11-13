@@ -73,22 +73,30 @@ def read_outline(
     for entity in doc.modelspace():
         pieces.extend(_polylines(entity, flat_tol / scale))
     pieces = [[(x * scale, y * scale) for x, y in piece] for piece in pieces]
+    return outline_from_pieces(path.name, pieces, join_tol, simplify_tol)
+
+
+def outline_from_pieces(
+    name: str, pieces: list[list[Point]], join_tol: float = 0.1, simplify_tol: float = 0.01
+) -> DxfOutline:
+    """Join curve pieces (polylines in mm, x along the chord, y up) into the outline.
+    Shared by the DXF reader and the STEP reader (step.py)."""
     pieces = [p for p in (_dedup(piece) for piece in pieces) if len(p) >= 2]
     if not pieces:
-        raise DxfError(f"{path.name}: no lines, arcs, polylines or splines found")
+        raise DxfError(f"{name}: no lines, arcs, polylines or splines found")
 
     warnings: list[str] = []
     loops, opens = _chain(pieces, join_tol)
     if not loops:
-        loops = _close_small_gap(path.name, opens, warnings)
+        loops = _close_small_gap(name, opens, warnings)
     loops.sort(key=lambda lp: abs(signed_area(lp)), reverse=True)
     if len(loops) > 1:
         warnings.append(
-            f"{path.name}: {len(loops)} closed outlines found; the largest is used, the "
+            f"{name}: {len(loops)} closed outlines found; the largest is used, the "
             "others (for example spar slots) are ignored. Add them as job features by hand."
         )
     if opens and loops[0] is not opens[0]:
-        warnings.append(f"{path.name}: {len(opens)} loose open piece(s) ignored")
+        warnings.append(f"{name}: {len(opens)} loose open piece(s) ignored")
 
     loop = loops[0]
     if signed_area(loop) < 0:
@@ -97,14 +105,14 @@ def read_outline(
     points, merged = sharpen_trailing_edge(points, TE_MERGE_RADIUS)
     if merged:
         warnings.append(
-            f"{path.name}: {merged + 1} points of a rounded trailing edge (within {TE_MERGE_RADIUS} mm) "
+            f"{name}: {merged + 1} points of a rounded trailing edge (within {TE_MERGE_RADIUS} mm) "
             "merged into one sharp point"
         )
     if simplify_tol > 0:
         xs = [p[0] for p in points]
         le = xs.index(min(xs))  # kept, like both trailing-edge points
         points = simplify(points[: le + 1], simplify_tol) + simplify(points[le:], simplify_tol)[1:]
-    return DxfOutline(path.name, tuple(points), tuple(warnings))
+    return DxfOutline(name, tuple(points), tuple(warnings))
 
 
 def sharpen_trailing_edge(points: list[Point], radius: float) -> tuple[list[Point], int]:

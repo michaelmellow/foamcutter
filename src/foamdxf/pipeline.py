@@ -1,6 +1,6 @@
-"""DXF files -> job -> CAM result: the steps shared by the CLI and the GUI."""
+"""DXF files (or a STEP model) -> job -> CAM result: the steps shared by the CLI and the GUI."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from foamcam.cam import CamResult, generate
@@ -10,11 +10,16 @@ from foamcam.sections import build_outline
 
 from .errors import DxfError
 from .jobgen import CutSettings, GeneratedJob, Placement, build_job
-from .outline import Point, read_outline
+from .outline import DxfOutline, Point, read_outline
+from .step import read_step, sections
 
 
 @dataclass(frozen=True)
 class Request:
+    """`root` and `tip` are the two DXFs. With `faces` set, `root` is a STEP model,
+    `faces` its (root, tip) flat faces, and the span is measured between them
+    (placement.span is ignored)."""
+
     root: Path
     tip: Path
     profile: Path
@@ -22,9 +27,12 @@ class Request:
     settings: CutSettings
     name: str | None = None
     simplify: float = 0.01
+    faces: tuple[int, int] | None = None
 
     @property
     def stem(self) -> str:
+        if self.faces is not None:
+            return f"{self.root.stem}-f{self.faces[0]}-f{self.faces[1]}"
         return f"{self.root.stem}-{self.tip.stem}"
 
 
@@ -38,13 +46,35 @@ class Plan:
 
 
 def make_job(request: Request) -> Plan:
-    """Read the profile and both DXFs and build the job. Raises DxfError or FoamcamError."""
+    """Read the profile and both DXFs (or the STEP faces) and build the job. Raises DxfError or FoamcamError."""
     profile = load_profile(request.profile)
-    root = read_outline(request.root, simplify_tol=request.simplify)
-    tip = read_outline(request.tip, simplify_tol=request.simplify)
-    generated = build_job(root, tip, profile, request.placement, request.settings, request.name)
+    placement = request.placement
+    root, tip, warnings, span = read_outlines(request.root, request.tip, request.faces, request.simplify)
+    if span is not None:
+        placement = replace(placement, span=span)
+    generated = build_job(root, tip, profile, placement, request.settings, request.name)
     job = load_job_text(generated.text, request.root.parent)
-    return Plan(request, profile, generated, job, root.warnings + tip.warnings)
+    return Plan(request, profile, generated, job, warnings)
+
+
+def read_outlines(
+    root: Path, tip: Path, faces: tuple[int, int] | None = None, simplify: float = 0.01
+) -> tuple[DxfOutline, DxfOutline, tuple[str, ...], float | None]:
+    """(root, tip, warnings, span) from two DXFs, or from STEP model `root` and its
+    `faces` (then span is measured; None for DXFs). Raises DxfError."""
+    if faces is not None:
+        cut = sections(read_step(root), *faces, simplify_tol=simplify)
+        return cut.root, cut.tip, cut.warnings, cut.span
+    r = read_outline(root, simplify_tol=simplify)
+    t = read_outline(tip, simplify_tol=simplify)
+    return r, t, r.warnings + t.warnings, None
+
+
+def outline_size(root: DxfOutline, tip: DxfOutline) -> tuple[float, float]:
+    """(length, height) of the box around both outlines: the smallest stock, before kerf."""
+    every = root.points + tip.points
+    xs, zs = [p[0] for p in every], [p[1] for p in every]
+    return max(xs) - min(xs), max(zs) - min(zs)
 
 
 def run_cam(plan: Plan) -> CamResult:

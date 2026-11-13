@@ -4,6 +4,14 @@ Reads the root and tip outlines, writes a job file (docs/formats/job-file.md)
 and, unless --job-only is given, runs the CAM on it to write G-code (.nc),
 report (.txt) and preview (.svg), exactly as `python -m foamcam cut` would.
 
+Instead of two DXFs, a STEP model with flat root and tip faces:
+
+  python -m foamdxf --step WING.step --list-faces
+  python -m foamdxf --step WING.step [--faces ROOT,TIP] --stock LENGTH,HEIGHT --profile PROFILE
+
+The span is then measured between the faces; --faces defaults to the pair
+`step.StepModel.suggest` picks (the parallel flat faces farthest apart).
+
 `python -m foamdxf --gui` opens the same thing in a window.
 """
 
@@ -16,6 +24,7 @@ from foamcam.errors import FoamcamError
 from .errors import DxfError
 from .jobgen import CutSettings, Placement
 from .pipeline import Request, make_job, run_cam, write_files
+from .step import read_step
 
 
 def pair(text: str) -> tuple[float, float]:
@@ -29,14 +38,18 @@ def pair(text: str) -> tuple[float, float]:
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m foamdxf",
-        description="Turn root and tip DXF outlines into a foamcutter job, then G-code.",
+        description="Turn root and tip DXF outlines (or two faces of a STEP model) into a foamcutter job, then G-code.",
     )
-    p.add_argument("root", type=Path, help="DXF of the root outline")
-    p.add_argument("tip", type=Path, help="DXF of the tip outline")
-    p.add_argument("--span", type=float, required=True, help="distance between the root and tip faces, mm")
-    p.add_argument("--stock", type=pair, required=True, metavar="LENGTH,HEIGHT",
+    p.add_argument("root", type=Path, nargs="?", help="DXF of the root outline")
+    p.add_argument("tip", type=Path, nargs="?", help="DXF of the tip outline")
+    p.add_argument("--span", type=float, help="distance between the root and tip faces, mm (DXFs only)")
+    p.add_argument("--step", type=Path, help="STEP model to use instead of the two DXFs")
+    p.add_argument("--faces", type=pair, metavar="ROOT,TIP",
+                   help="STEP face numbers of the root and tip (default: suggested; see --list-faces)")
+    p.add_argument("--list-faces", action="store_true", help="list the STEP model's flat faces and stop")
+    p.add_argument("--stock", type=pair, metavar="LENGTH,HEIGHT",
                    help="foam stock size: length along the chord and height, mm")
-    p.add_argument("--profile", type=Path, required=True, help="machine profile YAML")
+    p.add_argument("--profile", type=Path, help="machine profile YAML")
     p.add_argument("--out", type=Path, default=Path("output"), help="folder for the files (default: output)")
     p.add_argument("--name", help="job name (default: from the file names)")
     p.add_argument("--speed", type=float, default=150.0, help="cut speed at the faster face, mm/min (default 150)")
@@ -61,15 +74,48 @@ def main(argv: list[str] | None = None) -> int:
         from .gui import main as gui_main
 
         return gui_main(argv[1:])
-    args = parser().parse_args(argv)
+    p = parser()
+    args = p.parse_args(argv)
+    faces: tuple[int, int] | None = None
+    root: Path = args.step
+    tip: Path = args.step
+    try:
+        if args.step is not None:
+            if args.root is not None:
+                p.error("give either --step or the two DXFs, not both")
+            model = read_step(args.step)
+            if args.list_faces:
+                print(f"{args.step.name}: flat faces, largest first")
+                for face in model.faces:
+                    print(f"  {face.label()}")
+                print(f"suggested root,tip: {model.suggest()}")
+                return 0
+            if args.faces is not None:
+                faces = (int(args.faces[0]), int(args.faces[1]))
+            else:
+                faces = model.suggest()
+                if faces is None:
+                    raise DxfError(f"{args.step.name}: no two parallel flat faces; pick them with --faces")
+                print(f"using faces {faces[0]} (root) and {faces[1]} (tip)")
+        else:
+            if args.root is None or args.tip is None or args.span is None:
+                p.error("give ROOT and TIP DXFs and --span, or --step")
+            root, tip = args.root, args.tip
+    except DxfError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if args.stock is None or args.profile is None:
+        p.error("--stock and --profile are required")
     request = Request(
-        root=args.root,
-        tip=args.tip,
+        root=root,
+        tip=tip,
         profile=args.profile,
-        placement=Placement(args.span, args.stock[0], args.stock[1], args.block_x, args.lead_in, args.safe_clearance),
+        placement=Placement(args.span or 0.0, args.stock[0], args.stock[1], args.block_x, args.lead_in,
+                            args.safe_clearance),
         settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te),
         name=args.name,
         simplify=args.simplify,
+        faces=faces,
     )
     try:
         plan = make_job(request)
