@@ -77,18 +77,23 @@ To only check the committed binaries: `python firmware/build.py --verify`.
 
 ## Flash
 
-The SKR 3 EZ has BTT's SD-card bootloader. This method is from BTT and
-third-party guides; it was not carried out in this session.
+The SKR 3 EZ has BTT's SD-card bootloader. This method follows BTT's SKR 3 EZ
+user manual (official copy in github.com/bigtreetech/SKR-3, commit
+`b5d842e9`, firmware update section). It has not been carried out on the
+board yet. Do the power checks in the warning at the top of `wiring.md`
+before the first power-up.
 
 1. Format a microSD card as FAT32. Small cards (a few GB or less) are reported
    to work best.
 2. Copy the matching binary to the card's root and rename it `firmware.bin`.
 3. With the board powered off, insert the card. Power on and wait about 30 s.
-4. Remove the card and look at it on a PC. If the file is now named
+4. The status LED flashes during the update and stops when it is done.
+   Remove the card and look at it on a PC. If the file is now named
    `FIRMWARE.CUR`, the bootloader took it. That only shows the file was
    copied, not that the firmware runs: carry on with the bench test.
-5. Connect ioSender to the board's USB serial port (a virtual COM port; no
-   baud rate setting matters for USB CDC). Send `$I`. Expected:
+5. Check that the USB/CAN switch is in the popped-up (USB) position (manual
+   §3.4). Connect ioSender to the board's USB serial port (a virtual COM
+   port; no baud rate setting matters for USB CDC). Send `$I`. Expected:
    `[BOARD:BTT SKR-3]` and `[PLUGIN:Trinamic v0.33]` among the lines.
 6. Send `$RST=*` once, then apply the baseline settings (`settings.py`).
 

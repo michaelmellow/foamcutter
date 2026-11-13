@@ -1,5 +1,15 @@
 # Wiring sheet: BTT SKR 3 EZ, 4 axes, sensorless homing
 
+> **WARNING: check before the first power-up.**
+> - **Motor supply: 24 V maximum for this build.** The EZ2209 is rated
+>   4.75–28 V DC. The board's 48 V rating is for other drivers.
+> - **Motor-voltage jumpers.** Each driver slot has a jumper that picks where
+>   the driver's motor supply comes from. For one 24 V supply on Power In,
+>   all four used slots must select motherboard power. BTT's manual shows the
+>   two jumper positions only in photographs, with no pin labels in the text.
+>   Before fitting drivers, confirm each jumper with the power-off continuity
+>   check under "Power" below.
+
 Pin names are from the grblHAL board map `boards/btt_skr_v3.0_map.h` (driver
 commit `bfe5d4f6ec27`) and agree with the independent SKR 3 EZ H723 pin list
 at teamgloomy.github.io. Connector **pin numbers** (EXP2 pin 7 and so on) are
@@ -49,11 +59,55 @@ as triggered, which is a normally closed switch opening.
 
 ## Power
 
+Sources:
+- BTT SKR 3 EZ user manual, official copy in github.com/bigtreetech/SKR-3,
+  commit `b5d842e9`: §1.2 parameters, §1.1 features 19–20, §3.1, §3.2, §3.4.
+- The SKR 3 EZ V1.0 schematic from the same repository.
+- BTT's EZ2209 wiki page.
+
+**Maximum motor supply: 28 V, set by the EZ2209.** BTT's EZ2209 page gives
+"Power voltage (VM) 4.75V---28V DC". The board accepts up to 48 V on its
+separate Motor Power terminal (manual §1.2: "Motor Voltage: DC12V-DC48V").
+That 48 V is for other drivers: the manual names the TMC5160 and EZ5160
+("The motor power supply supports up to 48V, and for the larger voltage when
+using TMC5160 and EZ5160…", §1.1 item 20). **It must not be used with the
+EZ2209.** This build uses one 24 V supply, which is inside both the board's
+input range (DC 12–24 V) and the EZ2209's range.
+
 | Supply | Where | Notes |
 | --- | --- | --- |
-| Board and motors | the board's main power input | BTT: input DC 12–24 V, motor supply up to 48 V. A 24 V supply is the usual choice. |
+| Board and motors | **Power In** (DCIN) terminal | One 24 V supply. |
+| — | **Motor Power** terminal | **Leave unconnected.** |
 | PC | USB port | Serial link to ioSender (USB CDC). |
 | Hot wire | its own external supply | Not connected to the board in any way. The controller does not switch it. |
+
+**Motor-voltage selection jumpers** (manual §3.2; "Each motor drive module
+can select the corresponding motor voltage through the jumper cap", §1.1
+item 19). Each driver slot has a 3-pin header next to its large capacitor.
+In the schematic it is labelled, for example, "X-Motor Power selection",
+with pins `X-Motor_Power` (the driver's supply), `VBB` and `Motor_Power`
+(the separate terminal). The manual shows two positions:
+- §3.2.1 "Motherboard Power Voltage for Motor Voltage Selection" (top
+  picture on page 13): the driver takes its supply from Power In.
+- §3.2.2 "Motor Supply Voltage for Motor Voltage Selection" (bottom
+  picture): the driver takes its supply from the Motor Power terminal.
+
+For a single 24 V supply on Power In, set **all four used slots (X, Y, Z,
+E0) to the §3.2.1 position**. This setting is inferred from the manual's
+headings and photographs; the text names no pins. Confirm it, power off,
+with a continuity meter:
+1. On each header, the pin the jumper joins to the driver pin must beep to
+   the **+** screw of **Power In**. That is VBB; the path may run through the
+   board fuse.
+2. The pin left free must beep to the **+** screw of **Motor Power**.
+
+If either check fails, stop and do not power up.
+
+Other board settings from the manual:
+- **USB/CAN switch** (§3.4): it must be in the popped-up (USB) position, or
+  the PC will not see the board.
+- **VUSB jumper** (§3.1): leave it off. It is only for running the board
+  from USB power; the board takes its power from the 24 V supply.
 
 Never plug or unplug a motor or a driver with the motor supply on.
 
@@ -72,12 +126,18 @@ apply 5 V or 24 V.**
 
 Baseline `$14 = 6` matches this table. An open e-stop circuit (button
 pressed, wire broken or nothing connected) holds the controller in e-stop.
-**For the first power-up on the bench, connect the e-stop or a wire link
-from PA4 to GND**, or the board will sit in e-stop.
+For the bench test, EXP2 stays unconnected and a temporary `$14=70` makes
+the open e-stop input read inactive (`bench-test.md`). The last bench step
+restores `$14=6`.
 
-The controller's e-stop stops motion. It does not cut power. A machine e-stop
-should also open the hot-wire supply and the motor supply, for example with a
-second normally closed contact in the e-stop button driving a contactor.
+**Required: the e-stop must also open the hot-wire supply.** The
+controller's e-stop stops motion only; it does not cut any power, and the
+controller never switches the wire heat. The e-stop button must therefore
+have a second normally closed contact that opens the hot-wire supply
+directly, or through a contactor whose coil it switches, so that pressing
+e-stop removes wire heat. Do not run the machine with the wire heated until
+this is wired and tested (`commissioning.md`, step 0). Opening the motor
+supply as well is optional.
 
 PA5, PA6 and PA7 are also the SPI lines of the EXP2 connector, so a BTT
 display cannot be fitted at the same time.
@@ -92,7 +152,8 @@ display cannot be fitted at the same time.
   any series resistor or filter that changes DIAG timing. Check that with
   the jumper fitted there is continuity between the driver's DIAG pin and the
   STOP connector's signal pin.
-- Whether the SKR 3 EZ needs a jumper to select UART mode for the EZ2209
-  slots. Teamgloomy notes "The SKR3EZ H723 can't be used with SPI and UART
-  controlled drivers at the same time", which suggests a board-wide setting.
-  Check BTT's manual. `M122` in the bench test shows whether UART works.
+- Whether a UART mode jumper is needed. BTT's manual (§3.3.2) mentions none
+  for EZ drivers ("The EZ series drivers support the simultaneous use of both
+  UART and SPI drivers"). `M122` in the bench test shows whether UART works.
+- The motor-voltage jumper positions: see the warning at the top and the
+  continuity check under "Power".

@@ -253,8 +253,10 @@ or the wire is changed. `G10 L20` stores the offset in settings storage
 - **Anything on hardware.** None of the brief's acceptance tests has been run:
   `$I`, `M122`, the axis jogs and the timed 4-axis G93 move all need the
   bench test on the real board.
-- **Which MCU the board has.**
-- **The flashing procedure.** It comes from BTT and third-party guides.
+- **Which MCU the board has.** BTT's own manual and its board photo show
+  the STM32H743VI.
+- **The flashing procedure.** It now follows BTT's official SKR 3 EZ manual
+  (section 6), but it has not been carried out.
 - **The Creality 42-40's rated current.** Retail listings give 1.0 A (most,
   including Creality-branded ones) or 1.5 A; I found no Creality datasheet.
   The baseline uses 700 mA RMS, 70 % of the lower figure. The 200 steps/rev
@@ -262,9 +264,12 @@ or the wire is changed. `G10 L20` stores the offset in settings storage
 - **EZ2209 sense resistor.** 110 mΩ (the plugin default) comes from a search
   summary of BTT's wiki. BTT's own EZ2209 page does not state it. A wrong
   value scales every current setting.
-- **The DIAG jumper positions,** the EXP2 pin numbers (the board map comments
-  conflict with the usual EXP2 layout), and whether a UART-mode jumper is
-  needed. All are listed in `wiring.md`.
+- **The DIAG jumper positions and the EXP2 pin numbers.** The board map
+  comments conflict with the usual EXP2 layout. Bench step 3A now
+  identifies the EXP2 pins on the board. BTT's manual (§3.3.2) mentions no
+  UART-mode jumper for EZ drivers.
+- **The motor-voltage jumper positions.** They are shown only in the
+  manual's photographs. `wiring.md` gives a power-off continuity check.
 - **The TMC2209 datasheet relation** "stall when SG_RESULT ≤ 2 × SGTHRS",
   which the tuning method relies on. Not re-read this session.
 - **Whether ioSender handles G93 programs** (time estimate, preview), and
@@ -306,3 +311,93 @@ or the wire is changed. `G10 L20` stores the offset in settings storage
    merged. The excerpt tests read `1769fcc` from git and skip if it is
    missing, so `brief-3-cam-fixes` must reach `main` before or with this
    branch for those tests to run.
+
+## 6. Changes after the director's review
+
+The director approved the brief for bench testing, subject to six changes.
+All six are made, and tests for them are in `firmware/test_docs.py`.
+
+1. **Motor supply and jumpers** (`wiring.md`, with a warning at the top).
+   Sources: BTT's official SKR 3 EZ user manual and V1.0 schematic from
+   github.com/bigtreetech/SKR-3 at `b5d842e9`, and BTT's EZ2209 page.
+   - **Maximum motor supply for the EZ2209: 28 V.** BTT's EZ2209 page gives
+     "Power voltage（VM） 4.75V---28V DC". The board's 48 V (manual §1.2,
+     "Motor Voltage: DC12V-DC48V") is for the separate Motor Power terminal
+     with other drivers; the manual names the TMC5160 and EZ5160 (§1.1
+     item 20). The sheet says plainly that 48 V must not be used with the
+     EZ2209.
+   - **Jumpers.** Each driver slot has a 3-pin "Motor Power selection"
+     header. The schematic gives its pins as `<slot>-Motor_Power`, `VBB` and
+     `Motor_Power`. The manual (§3.2) shows two positions: §3.2.1
+     "Motherboard Power Voltage" and §3.2.2 "Motor Supply Voltage".
+   - **Setting for one 24 V supply on Power In:** all four used slots in the
+     §3.2.1 position, with Motor Power left unconnected.
+   - **What is confirmed:** the positions are shown only in photographs, and
+     the text names no pins. I could not confirm from the text that `VBB` is
+     the Power In rail. The sheet therefore carries a warning and a power-off
+     continuity check: the joined pin must beep to Power In +, and the free
+     pin to Motor Power +.
+   - **Also from the manual, now in the bench preconditions:** the USB/CAN
+     switch must be popped up (USB, §3.4), and the VUSB jumper stays off
+     (§3.1).
+2. **First power-up without EXP2.** Confirmed from the source:
+   - The control inputs have their pull-ups on with `$17=0`
+     (`grbl/ioports.c:1584`), so an unconnected PA4 reads high.
+   - `systemGetState` XORs every pin with `$14` (`Src/driver.c:1426-1454`).
+   - The following `aux_ctrl_scan_status` does nothing in this build
+     (`grbl/pin_bits_masks.h:410-434`; its options are off).
+   - So `$14=70` (e-stop 64 + feed hold 2 + cycle start 4) makes all three
+     unconnected inputs read inactive.
+
+   Bench steps 1, 2, 4, 5 and 6 now run with EXP2 unconnected and `$14=70`
+   (new step 1.4; 1.7 checks the board is `Idle`). Step 3 runs last:
+   - 3A finds GND by continuity, then confirms PA5, PA6 and PA4 against
+     BTT's pin diagram by touching each candidate pin with a 1 kΩ lead to GND
+     and watching `Pn:`.
+   - 3B wires the switches.
+   - 3C restores `$14=6` and runs the original input tests.
+   - Step 7.2 confirms `$14=6` at the end.
+
+   The step numbers were kept so they match the review.
+3. **Step 4.6** now requires at least 110 mm of clear travel in the jog
+   direction before the 100 mm jogs.
+4. **Commissioning checks.** Step 8.8, "Final profile checks", holds both:
+   (a) the profile letters are `"X" "Y" "Z" "A"`; (b) each `max_rate` is at
+   or below `$11n`, because grblHAL silently slows a G93 move that exceeds
+   `$11n` (`planner.c:326-327`). Check (b) is also step 4.1. Step 8.8 sits
+   inside step 8, so the procedure still ends with the G54 section.
+5. **E-stop.** The second normally closed contact that opens the hot-wire
+   supply is now a requirement in `wiring.md`. Commissioning has a new step 0
+   that tests it with a voltmeter on the hot-wire supply output before any
+   other step.
+6. **Driver source: staying on `dresco/STM32H7xx`, no rebuild.**
+   - `grblHAL/STM32H7xx` does not exist (GitHub API: 404).
+   - The grblHAL organisation's repositories include STM32F1xx, F3xx, F4xx
+     and F7xx drivers but no H7 driver.
+   - grblHAL's own controller list (grblhal.org/docs/getting-started/controllers/)
+     links the BTT SKR 3 row, and every other H7 board row, to
+     `https://github.com/dresco/STM32H7xx`. Its WebBuilder entry uses
+     `driver=STM32H7xx&board=BTT SKR 3`.
+   - `dresco/STM32H7xx` is not a fork of anything. It is the STM32H7 driver
+     grblHAL itself points to, not a fork of an official one.
+   - The pinned commit `bfe5d4f6ec27` is also its current HEAD (checked with
+     `git ls-remote`).
+
+**One finding from the manual.** The board has an on-board 24C32 EEPROM
+(manual §1.2). This build does not enable it, so settings and G54 offsets
+are stored in MCU flash, as `README.md` says. That works, but each `G10 L20`
+writes the flash. Enabling the EEPROM would need a rebuild with the EEPROM
+plugin, and its I2C pins on this board have not been checked. I have left it
+as it is unless you want it changed.
+
+## 7. Director's decisions (after review)
+
+- Question 3: do not merge sub-step moves in the CAM. 1 ms and half a step
+  are negligible.
+- Question 5: hard limits off is accepted.
+- Question 6: the axis letters stay a commissioning check (step 8.8 (a)).
+- Question 7: the e-stop must open the hot-wire supply (change 5).
+- Question 8: `brief-3-cam-fixes` reaches `main` before this branch.
+- Still open: question 1 (H723 or H743; the manual shows H743), question 2
+  (motor label current) and question 4 (homing directions). These are
+  expected from the bench results.

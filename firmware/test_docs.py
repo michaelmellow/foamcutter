@@ -69,3 +69,57 @@ def test_docs_reference_existing_files() -> None:
     for doc in DOCS:
         for ref in re.findall(r"`((?:bench|release)/[^`*]+)`", (HERE / doc).read_text()):
             assert (HERE / ref).exists(), f"{doc} refers to missing {ref}"
+
+
+WIRING = (HERE / "wiring.md").read_text()
+
+
+def sections(text: str) -> list[str]:
+    return re.findall(r"^## (\d+)\.", text, re.MULTILINE)
+
+
+def test_wiring_states_the_driver_voltage_limit_up_front() -> None:
+    top = WIRING.split("## Driver slots")[0]
+    assert "WARNING" in top
+    assert "24 V maximum" in top
+    assert "4.75–28 V" in top
+    power = " ".join(WIRING.split("## Power")[1].split("\n## ")[0].split())
+    assert "4.75V---28V DC" in power  # quoted from BTT's EZ2209 page
+    assert "for other drivers" in power
+    assert "must not be used with the EZ2209" in power
+    assert "Leave unconnected" in power
+    assert "§3.2.1" in power and "continuity" in power
+
+
+def test_wiring_requires_the_estop_to_open_the_wire_supply() -> None:
+    flat = " ".join(WIRING.split())
+    assert "Required: the e-stop must also open the hot-wire supply" in flat
+    assert "should also open the hot-wire" not in flat
+
+
+def test_bench_inputs_run_last_with_a_temporary_estop_inversion() -> None:
+    assert sections(BENCH) == ["0", "1", "2", "4", "5", "6", "3", "7"]
+    before_inputs = BENCH.split("## 3. Inputs")[0]
+    inputs = BENCH.split("## 3. Inputs")[1].split("## 7.")[0]
+    assert "Nothing connected to EXP2" in before_inputs
+    assert "| 1.4 | `$14=70`" in before_inputs
+    assert "1 kΩ resistor" in inputs  # pins identified with a meter first
+    assert inputs.index("3A.1") < inputs.index("`$14=6`, then soft reset")
+    assert "$14=6" in BENCH.split("## 7.")[1]
+
+
+def test_bench_states_clearance_before_100_mm_jogs() -> None:
+    row = next(line for line in BENCH.splitlines() if line.startswith("| 4.6 |"))
+    assert "at least 110 mm" in row
+
+
+def test_commissioning_final_profile_checks() -> None:
+    checks = " ".join(COMMISSIONING.split("**8.8 Final profile checks.**")[1].split())
+    assert '`"X"`, `"Y"`, `"Z"`, `"A"` in that order' in checks
+    assert "`max_rate` is at or below `$11n`" in checks
+    assert "Check (b)" in COMMISSIONING.split("## 4.")[1].split("## 5.")[0]
+
+
+def test_commissioning_tests_the_estop_heat_cut_first() -> None:
+    step0 = COMMISSIONING.split("## 0. Before you start")[1].split("## 1.")[0]
+    assert "E-stop cuts wire heat" in step0

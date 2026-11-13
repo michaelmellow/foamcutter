@@ -13,7 +13,7 @@ machine that the software reads.
 **Axis letters.** This firmware names the four axes X, Y, Z, A and nothing
 else (axis 4 can be renamed U only with a rebuild; see the Brief 1 report).
 The machine profile's `letter` fields must therefore be `"X" "Y" "Z" "A"` for
-axes 1 to 4, which is the profile default.
+axes 1 to 4, which is the profile default. Check (a) in step 8.8 confirms it.
 
 | Axis | Letter | Tower | Moves | Positive direction |
 | --- | --- | --- | --- | --- |
@@ -21,6 +21,17 @@ axes 1 to 4, which is the profile default.
 | 2 | Y | left | vertical | up |
 | 3 | Z | right | horizontal | toward the front |
 | 4 | A | right | vertical | up |
+
+## 0. Before you start
+
+1. The bench test has passed, and `$14` reads 6 (`$14`). With `$14=70` there
+   is no e-stop.
+2. **E-stop cuts wire heat** (required, `wiring.md`). Leave the wire clear of
+   everything and connect a voltmeter across the hot-wire supply output.
+   Switch the hot-wire supply on: the meter shows its voltage. Press the
+   e-stop: the meter must drop to 0 V. Release the e-stop and switch the
+   supply off again. If the voltage stays, stop: the machine must not be run
+   with a heated wire until this works.
 
 ## 1. Steps per mm (`$100`–`$103`)
 
@@ -56,9 +67,12 @@ add that axis's bit to `$3` (X 1, Y 2, Z 4, A 8). Example: Y and A wrong →
 
 ## 4. Speed and acceleration (`$110`–`$113`, `$120`–`$123`)
 
-1. `$11n` must be at least the profile's `max_rate` for that axis, or the
-   controller caps feed moves (planner.c:326) and a G93 move takes longer
-   than its program says.
+1. **Check (b): each axis's `max_rate` in the machine profile must be at or
+   below its `$11n`.** grblHAL silently slows any move that would take an
+   axis above `$11n` (planner.c:326-327). A G93 move then takes longer than
+   its F word commands, and the cut runs slower than programmed, which
+   changes the kerf. Repeat this check in step 8.8 after the profile is
+   final.
 2. Find the limit: jog the full travel at increasing rates (`F600`, `F900`,
    `F1200`, …). At the first rate where the motor stalls, skips or sounds
    rough, stop. Set `$11n` to 70 % of the last good rate. If that is below
@@ -195,6 +209,17 @@ after raising Y and A, sit against the x reference face when X and Z are 0.
 axis (`machine-profile.md` §5): jog the axis to the end of its safe travel at
 each end and read its G54 position (the work position in ioSender's DRO).
 Enter them in the profile.
+
+**8.8 Final profile checks.** With the profile filled in, check both and
+record the result:
+
+- **(a) Axis letters.** The profile's `axes[0..3].letter` are `"X"`, `"Y"`,
+  `"Z"`, `"A"` in that order. This firmware accepts no other letters, and a
+  program in other letters would fail or move the wrong axes.
+- **(b) Maximum rates.** For each axis n, the profile's `max_rate` is at or
+  below `$11n` (send `$$` to read them). Otherwise grblHAL silently slows any
+  G93 move that would exceed `$11n` (planner.c:326-327), and the cut takes
+  longer than programmed.
 
 ### When the zeros must be re-checked
 

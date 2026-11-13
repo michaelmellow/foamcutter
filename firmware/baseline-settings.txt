@@ -35,6 +35,8 @@ $5=0
 ; the pull-up means "switch open". Feed hold and cycle start are normally open
 ; push buttons to GND, so they are inverted (2 + 4). The e-stop is a normally
 ; closed contact to GND and is NOT inverted: a broken wire also stops the machine.
+; The bench test sets $14=70 temporarily (e-stop inverted, EXP2 unconnected)
+; and restores 6 in its step 3. Never run the machine with $14=70.
 $14=6
 
 ; ---- Limits and homing -----------------------------------------------------
