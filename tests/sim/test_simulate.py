@@ -194,6 +194,69 @@ G94
             assert gap <= 0.7 + 1e-3 or abs(p[0] - 150) > 1
 
 
+def test_short_edge_inside_the_slot_of_a_wider_corner_edge(
+    profile_data: dict[str, Any], job_data: dict[str, Any]
+) -> None:
+    # Table "step": kerf 1.4 up to 75 mm/min, 1.0 from 125 mm/min. Top and
+    # bottom at 50 mm/min (kerf 1.4, wire 0.7 outside: z = 40.7 and 19.3),
+    # left and right sides at 150 mm/min (kerf 1.0, wire 0.5 outside: x = 99.5
+    # and 200.5). Each corner of the wire path is the meeting point of the two
+    # offset lines, so the program is exact. Top and bottom are each split
+    # 0.3 mm from the right side, at x = 200.2:
+    #   S (200.5, 40.7) -> (200.2, 40.7) -> (99.5, 40.7) -> (99.5, 19.3)
+    #   -> (200.2, 19.3) -> (200.5, 19.3) -> S
+    # Durations T = L / v, F = 1 / T:
+    #   0.3 mm at 50:     T = 0.006    F = 166.667
+    #   100.7 mm at 50:   T = 2.014    F = 0.496524
+    #   21.4 mm at 150:   T = 0.142667 F = 7.00935
+    #   lead-in / exit 69.5 mm at 150: F = 2.15827
+    # The short bottom edge, moved 0.7 toward the material, is (200.2, 20) to
+    # (200.5, 20). The right side's wire runs along x = 200.5 from z = 19.3 up
+    # and melts everything within 0.5 of it: both those points are 0.3 and
+    # 0.0 mm from it, so that slot removes the whole surface the short edge
+    # would leave. The real corner is where the long bottom edge (z = 20) meets
+    # the right side (x = 200): (200, 20), the target corner. The same at the
+    # top right: (200, 40). So the deviation is 0.
+    # Joining only consecutive moved edges instead steps from (200.5, 20) to
+    # (200, 19.3), a point the right-hand slot has melted: 0.7 = half the
+    # top and bottom kerf, at both right-hand corners.
+    profile_data["kerf_tables"].append(
+        {
+            "name": "step",
+            "description": "1.4 up to 75 mm/min, 1.0 from 125 mm/min",
+            "points": [
+                {"speed": 25.0, "kerf": 1.4},
+                {"speed": 75.0, "kerf": 1.4},
+                {"speed": 125.0, "kerf": 1.0},
+                {"speed": 175.0, "kerf": 1.0},
+            ],
+        }
+    )
+    gcode = """\
+G21
+G54
+G90
+G93
+G0 X300.0000 Y100.0000 Z300.0000 A100.0000
+G0 X270.0000 Y40.7000 Z270.0000 A40.7000
+G1 X200.5000 Y40.7000 Z200.5000 A40.7000 F2.15827
+G1 X200.2000 Y40.7000 Z200.2000 A40.7000 F166.667
+G1 X99.5000 Y40.7000 Z99.5000 A40.7000 F0.496524
+G1 X99.5000 Y19.3000 Z99.5000 A19.3000 F7.00935
+G1 X200.2000 Y19.3000 Z200.2000 A19.3000 F0.496524
+G1 X200.5000 Y19.3000 Z200.5000 A19.3000 F166.667
+G1 X200.5000 Y40.7000 Z200.5000 A40.7000 F7.00935
+G1 X270.0000 Y40.7000 Z270.0000 A40.7000 F2.15827
+G0 X300.0000 Y100.0000 Z300.0000 A100.0000
+G94
+"""
+    job_data["kerf_table"] = "step"
+    result = run(gcode, profile_data, job_data)
+    for name in ("root", "tip"):
+        outer = result.sections[name].elements["outer"]
+        assert outer.max_deviation < 1e-6, (name, outer.max_deviation, outer.worst)
+
+
 # ---------------------------------------------------------------- acceptance: corruption
 
 
