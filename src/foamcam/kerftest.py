@@ -23,7 +23,7 @@ from .profile import Profile
 class KerfTest:
     block_x: float  # G54 x of the block's back face
     block_length: float  # along x
-    block_height: float  # along z, block resting on the table (z = 0)
+    block_height: float  # along z, block resting on the table (z = table_z of the profile)
     depth: float  # slot depth from the front face, mm
     speeds: tuple[float, ...]  # mm/min, one slot each, bottom slot first
     spacing: float  # vertical distance between slots, mm
@@ -45,11 +45,11 @@ def kerf_test_gcode(test: KerfTest, profile: Profile) -> str:
         problems.append("the slot depth must be greater than 0 and less than the block length")
     if test.lead_in <= 0 or test.spacing <= 0 or test.margin <= 0:
         problems.append("lead-in, spacing and margin must be greater than 0")
-    heights = [test.margin + i * test.spacing for i in range(len(test.speeds))]
-    if heights and heights[-1] > test.block_height - test.margin:
+    heights = [profile.table_z + test.margin + i * test.spacing for i in range(len(test.speeds))]
+    if heights and heights[-1] > profile.table_z + test.block_height - test.margin:
         problems.append(
             f"{len(test.speeds)} slots {test.spacing:g} mm apart with {test.margin:g} mm margins "
-            f"need a block at least {heights[-1] + test.margin:g} mm high"
+            f"need a block at least {heights[-1] - profile.table_z + test.margin:g} mm high"
         )
     if problems:
         raise CamError(problems)
@@ -93,7 +93,7 @@ def kerf_test_gcode(test: KerfTest, profile: Profile) -> str:
         if s[0] != s[2] or s[1] != s[3]:
             problems.append("the safe position must have axis 1 = axis 3 and axis 2 = axis 4 for the kerf test")
             break
-        if segment_hits_box(a, b, (test.block_x, 0.0), (front, test.block_height)):
+        if segment_hits_box(a, b, (test.block_x, profile.table_z), (front, profile.table_z + test.block_height)):
             problems.append("a rapid move between the safe position and the slots passes through the block")
     if problems:
         raise CamError(sorted(set(problems)))

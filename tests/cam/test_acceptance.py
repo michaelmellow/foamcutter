@@ -72,6 +72,7 @@ def constant_kerf_profile(**axis4: float) -> dict[str, Any]:
         "name": "test machine",
         "axes": axes,
         "wire_span": 900.0,
+        "table_z": 0.0,
         "limits": {"max_wire_angle": 30.0, "max_speed_ratio": 3.0},
         "kerf_tables": [
             {

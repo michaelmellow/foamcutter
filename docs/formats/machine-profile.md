@@ -33,9 +33,9 @@ expected). No unit suffixes.
 All tools work in one right-handed Cartesian frame, the **work frame**. It is
 the controller's **G54** work coordinate system. Every program selects G54 and
 every axis position in a program, in a profile and in a job is a G54
-coordinate. The controller's own machine coordinates (after homing) are never
-used by the software; the link between them and G54 is the G54 offset set by
-the operator (§3.4).
+coordinate. The controller's own machine coordinates are never used by the
+software; the link between them and G54 is the G54 offset set by the operator
+(§3.5).
 
 ### 3.1 Front, left and right
 
@@ -43,28 +43,13 @@ Stand facing the machine so that the left tower (the one carrying axes 1 and 2)
 is on your left and the right tower (axes 3 and 4) is on your right. You are
 standing at the front.
 
-### 3.2 Physical references
-
-The work frame is tied to two physical references, which must be in place
-before the zeros are set:
-
-- **The table top.** A flat surface under the wire. Its top is the
-  **z reference plane**.
-- **The x reference face.** A straight, flat, vertical face fixed to the table
-  near the back, facing the front, running from the left tower side to the
-  right tower side (for example a straight aluminium bar clamped to the table,
-  or the table's machined back edge). It must be perpendicular to the table top
-  and square to both towers, i.e. perpendicular to both carriage planes. The
-  longer it is, the more accurately it sets the zero; ideally it reaches close
-  to each tower.
-
-### 3.3 Axes and zeros
+### 3.2 Axes and zeros
 
 | Frame axis | Direction | Zero |
 | --- | --- | --- |
 | `y` | horizontal, along the wire, from the left tower toward the right tower | `y = 0` is the left carriage plane |
-| `z` | vertical, up | `z = 0` is the table top (the z reference plane) |
-| `x` | horizontal, toward the front | `x = 0` is the x reference face |
+| `z` | vertical, up | `z = 0` is the homed position of the vertical axes (axes 2 and 4) |
+| `x` | horizontal, toward the front | `x = 0` is the homed position of the horizontal axes (axes 1 and 3) |
 
 Check: `x = y × z`. With `y` pointing right and `z` pointing up, `x` points
 toward the person standing at the front.
@@ -88,38 +73,73 @@ no wire sag, no lag, and no shift of the wire point when the wire tilts.
 **Directions.** Axes 1 and 3 increase as their carriage moves toward the front.
 Axes 2 and 4 increase as their carriage moves up.
 
-**Zero of each axis.** Each axis has its own zero. The four zeros are defined
-by where the wire is, not by the controller:
+**Zero of each axis.** The zero of each axis is its homed position:
 
-| Axis | Tower | Zero is where | Set it like this (cold wire) |
-| --- | --- | --- | --- |
-| 1 | left, horizontal | the left wire point is at `x = 0` | Move both horizontal axes until the wire lies against the x reference face along its whole length, touching at both ends of the face. Axis 1 reads 0 there. |
-| 3 | right, horizontal | the right wire point is at `x = 0` | Same position as for axis 1. Axis 3 reads 0 there. |
-| 2 | left, vertical | the left wire point is at `z = 0` | Move both vertical axes until the wire lies on the table top along its whole length, just touching (a strip of paper drags under the wire at both ends of the table but does not slide freely). Axis 2 reads 0 there. |
-| 4 | right, vertical | the right wire point is at `z = 0` | Same position as for axis 2. Axis 4 reads 0 there. |
+| Axis | Tower | Homed position (G54 zero) |
+| --- | --- | --- |
+| 1 | left, horizontal | 1 mm off the operator-side stop of axis 1 |
+| 2 | left, vertical | 1 mm off the bottom stop of axis 2 |
+| 3 | right, horizontal | 1 mm off the operator-side stop of axis 3 |
+| 4 | right, vertical | 1 mm off the bottom stop of axis 4 |
 
-Because the wire is straight, if it touches a flat face at two points far
-apart it lies in that face's plane, and so do both wire points. The x zeros
-must be set with the wire clear of the table and the z zeros with the wire
-clear of the x reference face.
+These positions are fixed by the machine's construction and its homing set-up,
+not by this format. The accuracy of every zero is the homing repeatability of
+its axis.
+
+### 3.3 Squareness
+
+The wire is square to the towers by construction: when `a1 = a3` and
+`a2 = a4`, the wire is perpendicular to both carriage planes (parallel to
+`y`). Every tool assumes this. The software cannot check it.
+
+**One-time check** (cold wire, after the machine is built and whenever a tower,
+a carriage or a wire point is moved). Check at two positions far apart: the
+homed position, and all four axes at the same reading near the far end of
+their travel. At each position and at each tower, hold an engineer's square
+with its stock against the carriage plane and its blade along the wire, and
+check that the wire runs along the blade, seen from above and seen from the
+front. A gap `g` at the end of a blade of length `b` means the wire is out of
+square by about `g / b` radians, which moves its far end by about
+`wire_span · g / b`. The measurement of `table_z` (§3.4) is a second check of
+the vertical part: the two vertical axes must agree.
 
 Consequences that every tool relies on:
 
 - When `a1 = a3` and `a2 = a4`, the wire is perpendicular to both carriage
   planes (parallel to `y`).
-- The table top is at `z = 0`, so a foam block resting on the table has its
-  bottom face at `z = 0`.
+- The table top is at `z = table_z` (§3.4), so a foam block resting on the
+  table has its bottom face at `z = table_z`.
 
-### 3.4 What the operator must do
+### 3.4 Table height
 
-1. Fit the two physical references (§3.2).
-2. Set the four zeros (§3.3) by storing them as the G54 offset of each axis in
-   the controller. With the wire held at the zero position of an axis, the
-   grblHAL command `G10 L20 P1 <letter>0` makes that axis read 0 in G54.
-3. Re-check all four zeros after every homing cycle, until the homing
-   repeatability of each axis has been measured and is known to be small
-   enough for the parts being cut. After that, re-check them whenever a
-   reference, a wire point or the wire is changed.
+The table is a flat surface under the wire. The foam block rests on it. Its
+top is the plane `z = table_z`, where `table_z` is a profile field (§4). It may
+be negative, zero or positive.
+
+**Measuring `table_z`** (cold wire, after homing and setting G54, §3.5):
+
+1. Move both horizontal axes to the same reading, with the wire over the
+   table along its whole length.
+2. Lower the wire, one vertical axis at a time, until a strip of paper drags
+   under it at that axis's end of the table but does not slide freely. Do this
+   at both ends of the table.
+3. Read axes 2 and 4. They must agree. If they do not, the table top is not
+   parallel to the wire, or the wire is not square (§3.3); correct this before
+   cutting.
+4. Enter the reading as `table_z`.
+
+### 3.5 What the operator must do
+
+1. Home the machine.
+2. With every axis at its homed position, make all four axes read 0 in G54:
+   the grblHAL command `G10 L20 P1 <letter1>0 <letter2>0 <letter3>0 <letter4>0`
+   (the axis letters of §5) stores the G54 offsets.
+3. Do the squareness check (§3.3) once.
+4. Measure `table_z` (§3.4) and enter it in the profile. Measure it again
+   whenever the table or the wire is changed.
+5. Until the homing repeatability of each axis has been measured and is known
+   to be small enough for the parts being cut, repeat step 2 of §3.4 after
+   every homing cycle and check that axes 2 and 4 still read `table_z`.
 
 The software cannot check any of this. The Brief 1 commissioning procedure
 refers to this section.
@@ -129,7 +149,6 @@ refers to this section.
 
       back
    ┌─────────────────────────────────────────┐
-   │ ════════ x reference face (x = 0) ═════ │
    │ left tower                  right tower │
    │   │                               │     │
    │   L ───────── wire ───────────────R     │   ──► +y
@@ -148,6 +167,7 @@ version: 1
 name: "..."
 axes: [ ... 4 entries ... ]
 wire_span: 900.0
+table_z: 0.0
 limits: { ... }
 kerf_tables: [ ... ]
 ```
@@ -159,10 +179,9 @@ kerf_tables: [ ... ]
 | `name` | text | yes | Free name of this machine set-up, written into G-code comments. Non-empty. |
 | `axes` | list of 4 axis entries | yes | Entry 1 is axis 1, entry 2 is axis 2, and so on. See §5. |
 | `wire_span` | number, mm | yes | Distance along `y` between the left and right wire points, i.e. between the two carriage planes. Must be > 0. |
+| `table_z` | number, mm | yes | G54 `z` of the table top (§3.4). Any value: negative, zero or positive. |
 | `limits` | mapping | yes | Cutting limits. See §6. |
 | `kerf_tables` | list | yes | At least one kerf table. See §7. |
-
-There is no table-height field. The table top is `z = 0` by definition (§3.3).
 
 ## 5. Axis entries
 
@@ -186,8 +205,8 @@ axes:
 | `lead` | number, mm/rev | yes | Leadscrew lead of this axis. Must be > 0. Not used by the CAM or the simulator; recorded here because the profile is the single record of the machine. Steps per mm on the controller = (full steps per revolution × microsteps) / `lead`. |
 
 `min` and `max` are in the same G54 frame as every program. Measure them after
-the zeros are set: jog the axis to the end of its safe travel at each end and
-read its G54 position. Soft limits in this profile are checked by the
+homing and setting G54 (§3.5): jog the axis to the end of its safe travel at
+each end and read its G54 position. Soft limits in this profile are checked by the
 software. They are independent of any soft limits set in the controller.
 
 Axis roles are fixed:
