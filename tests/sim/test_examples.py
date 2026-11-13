@@ -1,12 +1,9 @@
 """Brief 5 acceptance on the Brief 3 worked examples (examples/gcode, examples/jobs).
 
-Result at the time of writing (see docs/reports/brief-5-report.md): every
-check passes, but all three programs miss the 0.05 mm deviation limit, by
-0.05 to 0.14 mm. The report traces each excess to the CAM method of job file
-sections 10.3 and 10.7 step 1. The deviation criterion is therefore recorded
-as a strict expected failure: it must start failing (XPASS) when the CAM or
-the format is changed so that the examples meet it, and then this marker must
-be removed.
+The first programs missed the 0.05 mm deviation limit because of the CAM
+method (docs/reports/brief-5-report.md), and that test was a strict expected
+failure. The regenerated programs meet it (docs/reports/brief-5-recheck-report.md),
+so it is now a plain test.
 """
 
 from __future__ import annotations
@@ -55,11 +52,6 @@ def test_example_checks_pass(name: str) -> None:
         assert all(e.edges > 0 for e in s.elements.values())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="CAM method (job file 10.3 resampling, 10.7 kerf at uncompensated speed) "
-    "gives 0.05 to 0.14 mm; see docs/reports/brief-5-report.md",
-)
 @pytest.mark.parametrize("name", EXAMPLES)
 def test_example_deviation_below_tolerance(name: str) -> None:
     r = result(name)

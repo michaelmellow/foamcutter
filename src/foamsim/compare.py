@@ -9,7 +9,10 @@ toward the material. The simulated surface of a target element (outer contour
 or hole) is the chain of those moved edges, each joined to the next at the
 intersection of their lines: that is the surface the material keeps where
 the wire turns toward the material, and at the other corners it is the sharp
-corner the wire cannot actually cut (see `inside_corner_rounding`).
+corner the wire cannot actually cut (see `inside_corner_rounding`). An edge
+whose whole moved edge lies inside the slot of the edge before or after it
+leaves no surface (a move shorter than the half kerf of a wider-kerf move it
+meets at a corner) and is left out of the chain before joining.
 
 Which element an edge cuts, and which side the material is on, is decided
 from the target alone:
@@ -191,6 +194,38 @@ def _chains(edges: list[Edge]) -> list[list[Edge]]:
     return chains
 
 
+def _in_slot(edge: Edge, other: Edge) -> bool:
+    """True if the whole moved `edge` lies inside the slot the wire melts along
+    `other` (all points within other.kerf / 2 of its path). The slot is convex,
+    so testing the two ends is enough."""
+    ends = np.vstack(edge.moved())
+    d, _ = point_segment_distances(ends, other.p0[None, :], other.p1[None, :])
+    return bool(np.all(d < other.kerf / 2 - JOIN_TOL))
+
+
+def _trim(chain: list[Edge], closed: bool) -> list[Edge]:
+    """Drop the edges whose surface a neighbouring edge's slot melts away
+    entirely: a move shorter than the half kerf of a wider-kerf move it meets
+    at a corner leaves no surface of its own. Repeated until nothing changes,
+    since each removal gives the edges either side new neighbours."""
+    edges = list(chain)
+    changed = True
+    while changed and len(edges) > 2:
+        changed = False
+        n = len(edges)
+        for i, e in enumerate(edges):
+            near = []
+            if closed or i > 0:
+                near.append(edges[i - 1])
+            if closed or i < n - 1:
+                near.append(edges[(i + 1) % n])
+            if any(_in_slot(e, o) for o in near):
+                del edges[i]
+                changed = True
+                break
+    return edges
+
+
 def _surface(edges: list[Edge]) -> tuple[list[tuple[Arr, bool]], float]:
     """Simulated surface as polylines (points, closed) and the largest
     inside-corner rounding."""
@@ -198,6 +233,7 @@ def _surface(edges: list[Edge]) -> tuple[list[tuple[Arr, bool]], float]:
     rounding = 0.0
     for chain in _chains(edges):
         closed = np.hypot(*(chain[-1].p1 - chain[0].p0)) < JOIN_TOL
+        chain = _trim(chain, bool(closed))
         points: list[Arr] = []
         pairs = list(itertools.pairwise(chain))
         if closed:

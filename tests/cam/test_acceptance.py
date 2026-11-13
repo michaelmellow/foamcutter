@@ -215,10 +215,20 @@ def test_tapered_projection_matches_hand_calculation(tmp_path: Path) -> None:
       root: S = (200.1, 50.1)  LE = (99.9, 50.1)  P2 = (99.9, 29.9)  P3 = (200.1, 29.9)
       tip:  S = (200.1, 60.1)  LE = (149.9, 60.1) P2 = (149.9, 49.9) P3 = (200.1, 49.9)
 
-    Corner P2 is kept by the resampling of §10.3: on the piece LE -> lower TE the
-    corner is at arc length 20 of 120 (root) and 10 of 60 (tip), both 1/6.
-    max_segment_length 10 gives m = ceil(120 / 10) = 12 steps, and 12/6 = 2, so
-    step 2 lands exactly on the corner in both sections.
+    Corner P2 (§10.3). The stretch LE -> lower TE is synchronised on the offset
+    polygons, by fraction of offset arc length. Offset lengths:
+      root: LE -> P2 = 20.2, P2 -> P3 = 100.2, total 120.4
+      tip:  LE -> P2 = 10.2, P2 -> P3 =  50.2, total  60.4
+    So the offset corner is at fraction 20.2 / 120.4 = 0.167774 at the root and
+    10.2 / 60.4 = 0.168874 at the tip. Both fractions are breakpoints, so there
+    are two lines, one at each corner:
+
+    P2r, at the root corner (fraction 0.167774):
+      root (99.9, 29.9)
+      tip 0.167774 * 60.4 = 10.13355 below the tip LE corner: (149.9, 60.1 - 10.13355) = (149.9, 49.96645)
+    P2t, at the tip corner (fraction 0.168874):
+      tip (149.9, 49.9)
+      root 0.168874 * 120.4 = 20.33245 from its LE corner, i.e. 0.13245 past P2: (100.03245, 29.9)
 
     Projection, y_r = 300, y_t = 600, wire_span = 900:
       s(0)   = (0 - 300) / 300   = -1  ->  a = root - 1 * (tip - root)
@@ -228,8 +238,10 @@ def test_tapered_projection_matches_hand_calculation(tmp_path: Path) -> None:
           a3 = 200.1 + 0          = 200.1   a4 = 50.1 + 20   = 70.1
       LE: a1 = 99.9 - 50          = 49.9    a2 = 50.1 - 10   = 40.1
           a3 = 99.9 + 100         = 199.9   a4 = 50.1 + 20   = 70.1
-      P2: a1 = 99.9 - 50          = 49.9    a2 = 29.9 - 20   = 9.9
-          a3 = 99.9 + 100         = 199.9   a4 = 29.9 + 40   = 69.9
+      P2r: a1 = 99.9 - 50                 = 49.9      a2 = 29.9 - 20.06645 = 9.83355
+           a3 = 99.9 + 100                = 199.9     a4 = 29.9 + 40.1329  = 70.0329
+      P2t: a1 = 100.03245 - 49.86755      = 50.1649   a2 = 29.9 - 20       = 9.9
+           a3 = 100.03245 + 2 * 49.86755  = 199.76755 a4 = 29.9 + 40       = 69.9
       P3: a1 = 200.1 - 0          = 200.1   a2 = 29.9 - 20   = 9.9
           a3 = 200.1 + 0          = 200.1   a4 = 29.9 + 40   = 69.9
 
@@ -241,7 +253,8 @@ def test_tapered_projection_matches_hand_calculation(tmp_path: Path) -> None:
         ("G0", (220.0, 40.1, 220.0, 70.1)),   # rapid to E
         ("G1", (200.1, 40.1, 200.1, 70.1)),   # lead-in ends at S
         ("G1", (49.9, 40.1, 199.9, 70.1)),    # LE
-        ("G1", (49.9, 9.9, 199.9, 69.9)),     # lower LE corner P2
+        ("G1", (49.9, 9.8336, 199.9, 70.0329)),     # lower LE corner P2, root reaches it
+        ("G1", (50.1649, 9.9, 199.7675, 69.9)),     # lower LE corner P2, tip reaches it
         ("G1", (200.1, 9.9, 200.1, 69.9)),    # lower TE P3
         ("G1", (200.1, 40.1, 200.1, 70.1)),   # back at S after the TE face
         ("G1", (220.0, 40.1, 220.0, 70.1)),   # exit ends at E
