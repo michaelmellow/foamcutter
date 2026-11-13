@@ -158,11 +158,11 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
     return Outline(section, tuple(new_contour), new_le, slit_index, features)
 
 
-def check_in_block(outline: Outline, block: Block, problems: list[str]) -> None:
-    """§6.7: every target point inside the block's x and z range."""
+def check_in_block(outline: Outline, block: Block, table_z: float, problems: list[str]) -> None:
+    """§6.7: every target point inside the block's x and z range (§5)."""
     worst = 0.0
     for p in outline.contour:
         x, z = outline.place(p)
-        worst = max(worst, block.x - x, x - (block.x + block.length), -z, z - block.height)
+        worst = max(worst, block.x - x, x - (block.x + block.length), table_z - z, z - (table_z + block.height))
     if worst > 1e-9:
         problems.append(f"{outline.section.label}: the section lies outside the block by up to {worst:.3f} mm")

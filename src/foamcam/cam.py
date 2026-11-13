@@ -71,7 +71,7 @@ def validate(job: Job, profile: Profile) -> tuple[Outline, Outline]:
     tip = build_outline(job.tip, job.min_te_thickness, problems)
     for outline in (root, tip):
         if outline is not None:
-            check_in_block(outline, job.block, problems)
+            check_in_block(outline, job.block, profile.table_z, problems)
     if (
         root is not None
         and tip is not None
@@ -329,7 +329,7 @@ class Cam:
 
         result.gcode = "\n".join(lines.text) + "\n"
         result.report = report(job, self.profile, result, self.kerf_used, self.stretches, self.kerf_rounds)
-        result.preview_svg = preview_svg(job, self.root, self.tip, comp_r, comp_t, refs)
+        result.preview_svg = preview_svg(job, self.profile, self.root, self.tip, comp_r, comp_t, refs)
         return result
 
     # --- §13 G-code ---------------------------------------------------------
@@ -424,14 +424,14 @@ class Cam:
                 self.problems.append(f"the rapid move {what} passes through the foam block")
 
     def rapid_hits_block(self, start: Axes, end: Axes) -> bool:
-        block, span = self.job.block, self.profile.wire_span
+        block, span, z0 = self.job.block, self.profile.wire_span, self.profile.table_z
         y_lo, y_hi = sorted((self.job.root.y, self.job.tip.y))
         planes = 100
         for j in range(planes + 1):
             s = (y_lo + (y_hi - y_lo) * j / planes) / span
             p0 = (start[0] + s * (start[2] - start[0]), start[1] + s * (start[3] - start[1]))
             p1 = (end[0] + s * (end[2] - end[0]), end[1] + s * (end[3] - end[1]))
-            if segment_hits_box(p0, p1, (block.x, 0.0), (block.x + block.length, block.height)):
+            if segment_hits_box(p0, p1, (block.x, z0), (block.x + block.length, z0 + block.height)):
                 return True
         return False
 

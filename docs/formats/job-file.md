@@ -124,10 +124,11 @@ The block is a rectangular box occupying
 ```text
 x from block.x            to block.x + block.length
 y from min(root.y, tip.y) to max(root.y, tip.y)
-z from 0                  to block.height
+z from table_z            to table_z + block.height
 ```
 
-The block rests on the table, whose top is `z = 0` (machine profile §3.3).
+where `table_z` is the G54 `z` of the table top, from the machine profile
+(machine profile §3.4). The block rests on the table.
 **The block's two end faces
 are the two section planes.** These two faces are the **foam faces**. Wire speeds
 "at the foam" always mean speeds at these two planes. (If the real block is
@@ -431,7 +432,8 @@ given in the text report instead.
 The program starts with a rapid move to `safe_position`, then a rapid move to
 the entry points. It ends with a rapid move from the entry points back to
 `safe_position`. The CAM rejects the job if either rapid move would pass
-through the block at any plane between the two foam faces.
+through the block (§5, from `z = table_z`) at any plane between the two foam
+faces.
 
 Before running the program the operator must make sure the wire can travel in
 a straight line from where it is to `safe_position` without touching foam.

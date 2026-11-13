@@ -50,6 +50,7 @@ class Profile:
     name: str
     axes: tuple[Axis, Axis, Axis, Axis]
     wire_span: float
+    table_z: float
     max_wire_angle: float
     max_speed_ratio: float
     kerf_tables: dict[str, KerfTable]
@@ -73,12 +74,13 @@ def load_profile_text(text: str) -> Profile:
 
 def parse_profile(data: Any) -> Profile:
     r = Reader()
-    top = r.mapping(data, "", {"format", "version", "name", "axes", "wire_span", "limits", "kerf_tables"})
+    top = r.mapping(data, "", {"format", "version", "name", "axes", "wire_span", "table_z", "limits", "kerf_tables"})
     if "format" in top and top["format"] != "foamcutter-machine-profile":
         r.problem("format", 'must be "foamcutter-machine-profile"')
     r.integer(top, "version", "", equal=1)
     name = r.text(top, "name", "", nonempty=True)
     wire_span = r.number(top, "wire_span", "", gt=0)
+    table_z = r.number(top, "table_z", "")
 
     axes: list[Axis] = []
     raw_axes = r.sequence(top, "axes", "")
@@ -121,4 +123,4 @@ def parse_profile(data: Any) -> Profile:
             tables[table_name] = KerfTable(table_name, description, tuple(points))
 
     r.raise_if_problems(WHAT)
-    return Profile(name, (axes[0], axes[1], axes[2], axes[3]), wire_span, max_angle, max_ratio, tables)
+    return Profile(name, (axes[0], axes[1], axes[2], axes[3]), wire_span, table_z, max_angle, max_ratio, tables)

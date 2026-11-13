@@ -38,7 +38,7 @@ def report(
         "Foam block (G54, mm)",
         f"  x {job.block.x:.3f} to {job.block.x + job.block.length:.3f}",
         f"  y {min(job.root.y, job.tip.y):.3f} to {max(job.root.y, job.tip.y):.3f} (foam faces: root y = {job.root.y:g}, tip y = {job.tip.y:g})",
-        f"  z 0.000 to {job.block.height:.3f}",
+        f"  z {profile.table_z:.3f} to {profile.table_z + job.block.height:.3f}",
         "",
         "Travel used (G54, mm)",
     ]
@@ -90,6 +90,7 @@ def wire_angle(axes: tuple[float, float, float, float], span: float) -> float:
 
 def preview_svg(
     job: Job,
+    profile: Profile,
     root: Outline,
     tip: Outline,
     comp_r: "dict[Ref, Point]",
@@ -97,10 +98,10 @@ def preview_svg(
     refs: "list[Ref]",
 ) -> str:
     """Front view (x right, z up) of block, target sections and wire paths at both faces."""
-    block = job.block
+    block, z0_block = job.block, profile.table_z
     x_entry = block.x + block.length + job.lead_in
     xs = [block.x, x_entry]
-    zs = [0.0, block.height]
+    zs = [z0_block, z0_block + block.height]
     shapes: list[tuple[list[Point], str, str, bool]] = []
     for outline, comp, colour in ((root, comp_r, "#1f6fb4"), (tip, comp_t, "#d9730d")):
         target = [outline.place(p) for p in outline.contour]
@@ -137,7 +138,7 @@ def preview_svg(
             "Solid = target section, dashed = wire path after kerf.</text>"
         ),
         (
-            f'<rect x="{sx(block.x):.2f}" y="{sz(block.height):.2f}" width="{block.length * scale:.2f}" '
+            f'<rect x="{sx(block.x):.2f}" y="{sz(z0_block + block.height):.2f}" width="{block.length * scale:.2f}" '
             f'height="{block.height * scale:.2f}" fill="#f2efe6" stroke="#999"/>'
         ),
     ]
