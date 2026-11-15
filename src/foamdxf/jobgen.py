@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from foamcam.profile import Profile
 
 from .errors import DxfError
+from .holes import CHANNELS, HolePair, pair_holes
 from .outline import DxfOutline, Point
 
 
@@ -46,6 +47,7 @@ class CutSettings:
     direction: str = "upper_first"
     max_segment_length: float = 1.0
     min_te_thickness: float = 0.6  # opens a sharp trailing edge to a face the kerf can follow
+    channel: str = "shortest"  # side the wire enters each hole from: "shortest", "upper" or "lower"
 
 
 @dataclass(frozen=True)
@@ -89,6 +91,15 @@ def build_job(
             f"the outlines need {width:.1f} x {height:.1f} mm (length x height) but the stock is "
             f"{placement.stock_length:g} x {placement.stock_height:g} mm"
         )
+    holes: list[HolePair] = []
+    if settings.channel not in CHANNELS:
+        problems.append(f'hole channel must be one of {", ".join(CHANNELS)}')
+    else:
+        try:
+            holes = pair_holes(root.points, root.holes, tip.points, tip.holes,
+                               settings.channel, settings.max_segment_length)
+        except DxfError as error:
+            problems.append(str(error))
     if problems:
         raise DxfError("cannot build the job:\n" + "\n".join(f"  - {p}" for p in problems))
 
@@ -131,8 +142,8 @@ def build_job(
             f"height: {_num(placement.stock_height)} }}"
         ),
     ]
-    lines += _section("root", root, dx, dz, y_root)
-    lines += _section("tip", tip, dx, dz, y_tip)
+    lines += _section("root", root, dx, dz, y_root, [(h.name, h.slit, h.root) for h in holes])
+    lines += _section("tip", tip, dx, dz, y_tip, [(h.name, h.slit, h.tip) for h in holes])
 
     summary = (
         f"root {root.source}: chord {root.chord:.1f} mm; tip {tip.source}: chord {tip.chord:.1f} mm",
@@ -149,11 +160,17 @@ def build_job(
             f"wire span {profile.wire_span:g} mm"
         ),
         f"safe position [{x_entry:.1f}, {z_safe:.1f}, {x_entry:.1f}, {z_safe:.1f}]",
+    ) + tuple(
+        f"{h.name}: {len(h.root)} points, channel from the {h.slit} side, "
+        f"{h.channel_lengths[0]:.1f} mm (root) / {h.channel_lengths[1]:.1f} mm (tip) long"
+        for h in holes
     )
     return GeneratedJob("\n".join(lines) + "\n", summary)
 
 
-def _section(label: str, outline: DxfOutline, dx: float, dz: float, y: float) -> list[str]:
+def _section(
+    label: str, outline: DxfOutline, dx: float, dz: float, y: float, features: list[tuple[str, str, tuple[Point, ...]]]
+) -> list[str]:
     le = outline.points[outline.le_index]
     chord = outline.chord
     shape: list[Point] = [((x - le[0]) / chord, (z - le[1]) / chord) for x, z in outline.points]
@@ -165,6 +182,11 @@ def _section(label: str, outline: DxfOutline, dx: float, dz: float, y: float) ->
         "  twist_axis: 0.0",
         f"  position: {{ x: {_num(le[0] + dx)}, y: {_num(y)}, z: {_num(le[1] + dz)} }}",
     ]
+    if features:  # §8: points in mm, origin at the leading edge
+        out.append("  features:")
+        for name, slit, pts in features:
+            out += [f"    - name: {_quote(name)}", '      kind: "hole"', f"      slit: {_quote(slit)}", "      points:"]
+            out += [f"        - [{x - le[0]:.6f}, {z - le[1]:.6f}]" for x, z in pts]
     return out
 
 

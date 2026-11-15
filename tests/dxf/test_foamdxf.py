@@ -125,7 +125,7 @@ def test_inch_drawing_is_scaled_to_mm(tmp_path: Path) -> None:
     assert read_outline(path).chord == pytest.approx(101.6)
 
 
-def test_inner_loop_is_ignored_with_a_warning(tmp_path: Path) -> None:
+def test_inner_loop_becomes_a_hole(tmp_path: Path) -> None:
     upper, lower = naca(200.0)
 
     def build(msp: object) -> None:
@@ -134,7 +134,9 @@ def test_inner_loop_is_ignored_with_a_warning(tmp_path: Path) -> None:
 
     out = read_outline(save(tmp_path / "slot.dxf", build))
     assert out.chord == pytest.approx(200.0)
-    assert any("largest is used" in w for w in out.warnings)
+    assert len(out.holes) == 1  # cut through a channel (holes.py), no longer ignored
+    assert sorted(out.holes[0]) == [(60, 0), (60, 8), (70, 0), (70, 8)]
+    assert signed_area(list(out.holes[0])) > 0
 
 
 def test_open_outline_with_a_big_gap_is_an_error(tmp_path: Path) -> None:

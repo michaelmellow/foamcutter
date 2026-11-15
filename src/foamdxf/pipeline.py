@@ -115,17 +115,21 @@ class PreviewGeometry:
     letters: tuple[str, str, str, str]  # G-code letters of axes 1 to 4
     phases: list[str]  # per path point: "entry", then the move kind: "lead_in", "cut" or "exit"
     safe_position: tuple[float, float, float, float]  # axes 1 to 4
+    root_holes: tuple[list[Point], ...] = ()  # inner contours (features), placed, at the root face
+    tip_holes: tuple[list[Point], ...] = ()
 
 
 def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
     job, profile = plan.job, plan.profile
     targets = []
+    holes = []
     for section in (job.root, job.tip):
         problems: list[str] = []
         outline = build_outline(section, job.min_te_thickness, problems)
         if outline is None:
             raise DxfError("; ".join(problems))
         targets.append([outline.place(p) for p in outline.contour])
+        holes.append(tuple([outline.place(p) for p in f.points] for f in section.features if f.kind == "hole"))
 
     # the wire path from the entry point (end of the last rapid before the cut) to the exit
     first = next(i for i, m in enumerate(result.moves) if m.kind != "rapid")
@@ -157,6 +161,8 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
         letters=profile.letters,
         phases=["entry"] + [m.kind for m in feed_moves],
         safe_position=job.safe_position,
+        root_holes=holes[0],
+        tip_holes=holes[1],
     )
 
 

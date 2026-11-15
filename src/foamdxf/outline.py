@@ -33,11 +33,15 @@ class DxfOutline:
     the leading edge and back along the lower side to the lower trailing edge.
     The closing edge from the last point back to the first is the trailing-edge
     face (zero length for a sharp trailing edge, which is then not repeated).
+
+    `holes` are the closed inner contours (spar holes, lightening holes) in the
+    same frame, each counter-clockwise; see holes.py for how they are cut.
     """
 
     source: str
     points: tuple[Point, ...]
     warnings: tuple[str, ...]
+    holes: tuple[tuple[Point, ...], ...] = ()
 
     @property
     def le_index(self) -> int:
@@ -90,13 +94,22 @@ def outline_from_pieces(
     if not loops:
         loops = _close_small_gap(name, opens, warnings)
     loops.sort(key=lambda lp: abs(signed_area(lp)), reverse=True)
-    if len(loops) > 1:
-        warnings.append(
-            f"{name}: {len(loops)} closed outlines found; the largest is used, the "
-            "others (for example spar slots) are ignored. Add them as job features by hand."
-        )
     if opens and loops[0] is not opens[0]:
         warnings.append(f"{name}: {len(opens)} loose open piece(s) ignored")
+
+    # inner contours: inside the outer one and not inside another hole (a tube
+    # drawn with both diameters gives one hole, the outer diameter)
+    holes: list[list[Point]] = []
+    ignored = 0
+    for inner in loops[1:]:
+        if all(inside(p, loops[0]) for p in inner) and not any(inside(inner[0], h) for h in holes):
+            holes.append(inner if signed_area(inner) > 0 else inner[::-1])
+        else:
+            ignored += 1
+    if ignored:
+        warnings.append(f"{name}: {ignored} closed contour(s) outside the outline or inside a hole ignored")
+    if simplify_tol > 0:
+        holes = [simplify(h + h[:1], simplify_tol)[:-1] for h in holes]
 
     loop = loops[0]
     if signed_area(loop) < 0:
@@ -112,7 +125,19 @@ def outline_from_pieces(
         xs = [p[0] for p in points]
         le = xs.index(min(xs))  # kept, like both trailing-edge points
         points = simplify(points[: le + 1], simplify_tol) + simplify(points[le:], simplify_tol)[1:]
-    return DxfOutline(name, tuple(points), tuple(warnings))
+    return DxfOutline(name, tuple(points), tuple(warnings), tuple(tuple(h) for h in holes))
+
+
+def inside(p: Point, loop: list[Point]) -> bool:
+    """Point in polygon (even-odd rule)."""
+    x, y = p
+    result = False
+    n = len(loop)
+    for i in range(n):
+        (xa, ya), (xb, yb) = loop[i], loop[(i + 1) % n]
+        if (ya > y) != (yb > y) and x < xa + (y - ya) * (xb - xa) / (yb - ya):
+            result = not result
+    return result
 
 
 def sharpen_trailing_edge(points: list[Point], radius: float) -> tuple[list[Point], int]:

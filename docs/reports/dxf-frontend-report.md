@@ -236,3 +236,34 @@ when gmsh is not installed.
 Also in this change: the Section tab's horizontal axis is inverted (+x, away
 from the operator, runs right to left, as seen from the X/Y side). The 3D tab
 is unchanged.
+
+## 7. Inner contours cut through a channel (owner's request)
+
+Closed contours inside the outline (a circular carbon-spar hole, a rectangular
+slot, lightening holes) are no longer ignored. They become `kind: "hole"`
+features (job-file.md §8), which the CAM already cuts: in along a straight
+channel (slit) from the outer contour, once round the hole, back out the same
+channel. No change to foamcam or to the formats.
+
+- `outline.outline_from_pieces` keeps every loop inside the outline as a hole;
+  a loop inside a hole (a tube drawn with both diameters) is ignored with a
+  warning, so the hole is the outer diameter. STEP faces get holes the same way.
+- `holes.py`: root and tip need the same number of holes; they are paired by
+  position. Both loops are re-sampled to the same vertex count (§8), piece by
+  piece between matching corners: straight sides stay one move each (short
+  pieces at corners make the kerf iteration oscillate), curves get sides of
+  about `max_segment_length`, circles at least 16. The first point is the top
+  of the hole for an upper channel, the bottom for a lower one.
+- Channel side: form field "Hole channel from" / `--channel`, `shortest`
+  (default, per hole the shorter channel at root and tip together), `upper` or
+  `lower`.
+- The preview draws the holes; the summary lists each hole's channel.
+- Examples: `examples/dxf/spar-root.dxf`, `spar-tip.dxf` (the dry-run wing with
+  a 6 mm tube).
+
+Limit found: holes whose radius is close to the kerf (about 2 mm radius or
+less with the sample kerf table) make the kerf compensation fail to settle,
+and the CAM reports it. Real spar holes (6 mm and up) are fine.
+
+The channel leaves a kerf-wide cut in the part from the surface to the hole;
+glue fills it when the spar goes in.

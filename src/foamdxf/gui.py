@@ -25,6 +25,7 @@ from foamcam.errors import FoamcamError
 from foamcam.profile import load_profile
 
 from .errors import DxfError
+from .holes import CHANNELS
 from .jobgen import CutSettings, Placement
 from .outline import Point
 from .pipeline import (
@@ -74,6 +75,7 @@ CUT_FIELDS = [
 ]
 DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
+DEFAULTS |= {"channel": "shortest"}  # side the wire enters inner contours (holes) from
 # STEP workflow: source "step" uses the model and two of its flat faces (numbers) instead of the DXFs
 DEFAULTS |= {"source": "dxf", "step": "", "root_face": "", "tip_face": ""}
 # which stock values were typed last ("absolute" or "margin"): kept when the outlines change
@@ -152,6 +154,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         direction=values.get("direction", "upper_first"),
         max_segment_length=req("segment", labels["segment"]),
         min_te_thickness=req("min_te", labels["min_te"]),
+        channel=values.get("channel", "shortest"),
     )
     return Request(
         root=paths["root"],
@@ -410,7 +413,10 @@ class SlicerWindow:
         ttk.Label(cut, text="Direction").grid(row=1, column=0, sticky="w", pady=2)
         ttk.Combobox(cut, textvariable=self.vars["direction"], state="readonly", width=22,
                      values=("upper_first", "lower_first")).grid(row=1, column=1, columnspan=2, sticky="we", padx=4)
-        self._number_rows(cut, CUT_FIELDS, first_row=2)
+        ttk.Label(cut, text="Hole channel from").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Combobox(cut, textvariable=self.vars["channel"], state="readonly", width=22,
+                     values=CHANNELS).grid(row=2, column=1, columnspan=2, sticky="we", padx=4)
+        self._number_rows(cut, CUT_FIELDS, first_row=3)
 
         out = ttk.LabelFrame(form, text="Output", padding=6)
         out.pack(fill=tk.X, pady=(8, 0))
@@ -904,7 +910,7 @@ class SlicerWindow:
         c.create_line(*self._to_canvas(g.tower_34), fill=COLOURS["tower_34"], dash=(5, 3))
         c.create_line(*self._to_canvas(g.root_cut), fill=COLOURS["root"], width=2)
         c.create_line(*self._to_canvas(g.tip_cut), fill=COLOURS["tip"], width=2)
-        for target in (g.root_target, g.tip_target):
+        for target in (g.root_target, g.tip_target, *g.root_holes, *g.tip_holes):
             c.create_line(*self._to_canvas(target + target[:1]), fill=COLOURS["target"], width=1)
 
         # axis labels at the travel corners (x runs right to left)

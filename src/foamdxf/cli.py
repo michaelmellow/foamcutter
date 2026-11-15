@@ -22,6 +22,7 @@ from pathlib import Path
 from foamcam.errors import FoamcamError
 
 from .errors import DxfError
+from .holes import CHANNELS
 from .jobgen import CutSettings, Placement
 from .pipeline import Request, make_job, run_cam, write_files
 from .step import read_step
@@ -55,6 +56,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--speed", type=float, default=150.0, help="cut speed at the faster face, mm/min (default 150)")
     p.add_argument("--kerf-table", help="kerf table name (default: the profile's first)")
     p.add_argument("--direction", choices=("upper_first", "lower_first"), default="upper_first")
+    p.add_argument("--channel", choices=CHANNELS, default="shortest",
+                   help="side the wire enters each inner contour (hole) from (default: the shorter channel)")
     p.add_argument("--lead-in", type=float, default=20.0, help="clearance in front of the stock, mm (default 20)")
     p.add_argument("--block-x", type=float, help="G54 x of the stock's back face (default: centred in travel)")
     p.add_argument("--safe-clearance", type=float, default=20.0,
@@ -112,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         profile=args.profile,
         placement=Placement(args.span or 0.0, args.stock[0], args.stock[1], args.block_x, args.lead_in,
                             args.safe_clearance),
-        settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te),
+        settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te, args.channel),
         name=args.name,
         simplify=args.simplify,
         faces=faces,

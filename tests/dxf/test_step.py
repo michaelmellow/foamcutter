@@ -240,7 +240,11 @@ def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SlicerWi
     root.destroy()
 
 
-def test_window_step_workflow(window: SlicerWindow, tmp_path: Path, wing: Path) -> None:
+def test_window_step_workflow(
+    window: SlicerWindow, tmp_path: Path, wing: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    warnings: list[str] = []  # the "files restored" dialog would wait for a click
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda _title, text, **_kw: warnings.append(text))
     window.vars["profile"].set(str(PROFILE))
     window.vars["source"].set("step")
     window._source_changed()
@@ -273,6 +277,7 @@ def test_window_step_workflow(window: SlicerWindow, tmp_path: Path, wing: Path) 
         opened = open_project(project)
         assert Path(opened.values["step"]).parent == tmp_path / "proj" / "wing_files"
         assert window.open_project(project)
+        assert warnings and "is missing" in warnings[0]
         assert window.vars["source"].get() == "step"
         assert window.vars["root_face"].get() == str(pair[1])
         assert window.geometry is not None

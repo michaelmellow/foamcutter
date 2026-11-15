@@ -184,6 +184,9 @@ class View3D:
         self._line([(x, yb, z) for x, z in g.tip_cut], COLOURS["tip"], width=2)
         self._line([(x, ya, z) for x, z in g.root_target], COLOURS["text"], closed=True)
         self._line([(x, yb, z) for x, z in g.tip_target], COLOURS["text"], closed=True)
+        for y, holes in ((ya, g.root_holes), (yb, g.tip_holes)):
+            for hole in holes:
+                self._line([(x, y, z) for x, z in hole], COLOURS["text"], closed=True)
 
         # the wire at the scrubbed position
         i = self.wire_index
