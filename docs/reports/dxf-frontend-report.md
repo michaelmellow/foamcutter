@@ -267,3 +267,205 @@ and the CAM reports it. Real spar holes (6 mm and up) are fine.
 
 The channel leaves a kerf-wide cut in the part from the surface to the hole;
 glue fills it when the spar goes in.
+
+## 8. Built-in sender, stage 1: Machine tab (owner's request)
+
+The window can send the cut to grblHAL itself, with no file saving and
+picking. Code: `src/foamdxf/sender.py` (protocol, no Tk) and
+`src/foamdxf/machine.py` (the tab). New dependency: `pyserial` (dxf group).
+
+- **Connect** to a serial port. The board's STM32 virtual COM port is picked
+  by default. Before the first status report the tab says "Connecting…".
+  After 3 s with no answer it reports "no answer" and releases the port.
+- **Live DRO**: polls `?` five times a second. It shows the work position
+  (MPos − WCO; the last WCO is kept, because grblHAL sends it only now and
+  then), the machine position, the state badge, feed, free planner blocks and
+  rx bytes, and active input pins. Axes are shown in the controller's order,
+  X Y Z A, each labelled with the tower axis the profile drives with it.
+- **Streaming** uses character counting against the receive buffer size
+  read from `$I` `[OPT:…]` (1024 on the as-flashed board; Grbl's 128 until
+  it is read). Comments and blank lines are dropped.
+- **Program**: the last Preview (refused if the form changed since then), or
+  any `.nc` file. Start needs state Idle and asks for confirmation (stock,
+  work zero, wire heat on, path clear).
+- **Hold / Resume**: `!` and `~`. **Stop**: hold, then soft reset once a
+  fresh status report says `Hold:0` (or after 10 s). **Unlock**: `$X`.
+- **On the first `error:`** nothing more is sent and the machine is held.
+  Resume is disabled, because grblHAL would otherwise run the following lines
+  with one move missing. The operator presses Stop. **ALARM** ends the program.
+- Closing the window, or Disconnect, during a cut asks first, then stops and
+  releases the port.
+
+**ioSender at the same time:** Windows lets one program open a COM port at a
+time. While ioSender is connected, Connect fails with "COM6 is in use by
+another program. Disconnect ioSender (or close it) first." This was seen on
+this PC, with ioSender holding the board's port.
+
+Verified: `tests/dxf/test_sender.py` runs against a fake controller that
+fails the test if its receive buffer is ever overfilled. It covers:
+- a whole program streamed in order;
+- error → hold, nothing more sent, Resume refused, Stop resets;
+- the reset comes only after Hold:0;
+- hold and resume;
+- alarm;
+- Start refused unless Idle;
+- no answer;
+- the port-in-use message;
+- the window test: Preview → Connect → Start → finished → stale preview
+  blocks Start → Disconnect.
+
+NOT verified: anything on the real board. Not yet tested on the board: that
+reset after Hold:0 keeps position without ALARM (documented Grbl behaviour),
+the real status fields with `$10=511`, and streaming speed with G93 short
+moves. First real test: wire cold, no foam, a dry-run program.
+
+Not built (stages 2 and 3): jogging, homing macro, MDI, go-to-edge from the
+Align tab, overrides. Wire heat is switched by hand: the controller does not
+control it (CLAUDE.md), so the app cannot switch it either.
+
+### 8.1 Additions: speeds in the DRO, live section, feed override, dry runs
+
+- **DRO feed and actual cutting speed.** The DRO shows two things:
+  - **Controller feed**: the `FS:` field, the rate the controller reports.
+  - **Wire speed**: how fast the wire is really moving at the root face, at
+    the tip face, and at each tower. It comes from the position change
+    between two status reports, about 0.2 s apart. A face point is the
+    point on the straight wire at that face's fraction of the tower distance.
+  - The face speeds need a current Preview to know where the faces are; with
+    a picked .nc file only the tower speeds are shown. Code:
+    `machine.wire_speeds`.
+- **Live section.** While connected, the Section tab draws both carriages
+  (squares), the wire between them, and where the wire is at the root and tip
+  faces (dots). A test checks that the preview's carriage positions are the
+  G-code's coordinates, so the dots sit on the cut paths. This holds only
+  when the machine's work zero is the one the program was made for.
+- **Feed override 50-200 %** with a slider and a "100 %" button. It uses the
+  grblHAL realtime bytes 0x90-0x94, steps of 10 then 1, so it never passes
+  through other values. The slider follows the `Ov:` field the controller
+  reports, for example back to 100 % after a reset. grblHAL itself allows
+  10-200 %. The kerf table is speed-dependent, so a different override
+  changes the kerf; the tab says so.
+- **Dry run at ×2, ×3, ×5 or ×10.**
+  - What it changes: every F word in the program is multiplied, which makes
+    the cut that many times faster in both G93 (F = 1/min) and G94.
+  - What it leaves alone: rapids, and the controller's per-axis max rates,
+    which still apply.
+  - What it looks like: Start reads "Start DRY RUN", and the confirmation
+    asks for wire heat OFF and no foam.
+  - It is off every time the window opens, so a real cut is never sent fast
+    by mistake.
+  - It goes beyond 200 % because the program itself is rewritten; the override
+    stays the controller's.
+
+Verified by tests (`tests/dxf/test_sender.py`):
+- the override bytes and clamping, through the fake controller;
+- feed scaling, with comments and G0 untouched;
+- tower mapping for the real profile's letters (axis 1 = Z);
+- face speed arithmetic;
+- a window test: dry run ×5 sends exactly the scaled program, the speed line
+  appears while moving, live markers appear and are removed on disconnect,
+  and the override slider reaches the controller.
+
+NOT verified on the board: whether grblHAL applies the feed override to G93
+moves as expected (Grbl applies it to all feed moves; not checked in the
+source), and what `FS:` reports during G93 moves.
+
+### 8.2 Stage 2: jog, homing macro, MDI, go to an edge; section beside the console
+
+**Layout of the Machine tab**, from top to bottom:
+- port bar;
+- DRO;
+- a run bar that is always visible: Start / Hold / Resume / Stop / Unlock
+  and the progress bar;
+- a **controls** notebook: Program, Jog, Home;
+- a **views** notebook: Section and Console. The two notebooks are split by
+  a draggable divider.
+The Section view moved here from the main tabs, so the live position is
+visible while running. It now fits the stock and cut paths, not the whole
+travel, and its legend is laid out in two columns.
+
+- **Jog** sends `$J=G91 G21 … F…` jogs. The feed and the step (0.1-50 mm,
+  editable) are set in the tab. "Stop jog" sends the jog cancel byte (0x85).
+  - Jog either tower's horizontal or vertical axis, or both towers together
+    (a straight wire stays straight).
+  - **Keep inside the profile's travel** (on by default): the jog is
+    shortened so no axis leaves the profile's `min`/`max`. These are G54
+    positions, per the profile header. All axes are shortened by the same
+    factor, so a jog of both towers keeps the wire as it was.
+  - Without homing, these limits are only as good as the current zero.
+- **Home**: the owner's homing macro from `foamcutter-handoff.md` §1,
+  editable, with "Restore default". It runs like a program (character
+  counting, stop on error, Hold/Stop work). The confirmation lists the
+  handoff's warnings: table clear, wire cold, the verticals go down, under
+  300 mm from each stop.
+- **MDI** line under the console: Enter sends, Up/Down recall the last 50
+  commands. Refused while a program runs.
+- **Align stock → Go there**: sends that edge's three lines (lift, across,
+  down) through the Machine tab, after a wire-cold, no-stock confirmation.
+- The homing macro, jog step/feed/limit and MDI history are kept in
+  `~/.foamdxf-machine.json`, not in projects.
+
+Verified by tests:
+- jog clamping, including the same factor for both towers;
+- jog and jog cancel reach the fake controller;
+- a window test of jog (shortened at the stops), MDI and history, the homing
+  macro streamed in full, go-to-edge sending the edge's lines, the section
+  view inside the Machine tab, and the settings saved on disconnect.
+- `test_gui.py`'s align-tab test now also expects the "Go there" button.
+
+NOT verified on the board:
+- that `M906` (Trinamic plugin) is accepted in a streamed program;
+- jog cancel behaviour;
+- the macro itself: see the handoff's list of things to check, in particular
+  the verticals homing down and the 300 mm seek.
+
+### 8.3 Section view: zoom, pan, and moving the wire with the mouse
+
+- **Mouse wheel** zooms about the cursor (×1.2 per notch, 0.2-50×).
+  **Right-drag** pans. **Fit view** resets both.
+- **"Mouse moves the wire"** (a checkbox above the section, off at every
+  start) enables the moves below. They are also refused unless the machine
+  is connected, Idle or jogging, and no program is running.
+- **Left click**: both towers go to the clicked (x, z), so the wire is
+  straight there. It sends an absolute jog `$J=G90 G21 Z.. A.. X.. Y.. F<jog
+  feed>`, kept inside the profile travel when the Jog tab's box is ticked.
+  Stop jog on the Jog tab cancels it.
+- **Hold X or Z + click**: only the tower whose horizontal axis has that
+  letter moves (X → the X/Y tower, Z → the Z/A tower, read from the profile).
+  The keys are tracked window-wide. The canvas takes the keyboard focus when
+  the mouse enters it with moves enabled, so a held X is not typed into the
+  MDI line.
+- **Drag**: the towers follow the mouse. The newest target is sent only once
+  three things are true:
+  - the last jog was answered;
+  - a status report has arrived since then;
+  - the planner (`Bf:`, size from `$I`) holds at most the running block.
+  So moves do not pile up behind the mouse. Releasing the button sends the
+  final point. Status polling runs at 10 Hz during a drag, otherwise 5 Hz.
+- A cross marks the last target: red for both towers, the tower's colour for
+  one.
+
+Verified by tests:
+- absolute-jog clamping and tower targets;
+- zoom keeps the point under the cursor, and panning;
+- a click is ignored until moves are enabled;
+- a click sends both towers;
+- X held sends only X/Y;
+- a drag sends several but far fewer jogs than mouse events, ends on the
+  release point, and restores the polling rate.
+
+NOT verified on the board: how smooth following feels with real jog
+acceleration (Grbl stops at the end of each jog block unless the next is
+queued in time).
+- **Mouse speed slider** above the section: from 50 mm/min up to the
+  controller's rapid rate. It sets the feed of click and drag moves only;
+  the Jog tab keeps its own feed.
+  - The rapid rate is the slowest of `$110`-`$113`, read with a `$$` the
+    sender sends at connect. Its output is kept out of the console; a `$$`
+    typed in MDI is still shown.
+  - At the top the label reads "RAPID … mm/min".
+  - Until connected, the slider tops out at 3000 and says so.
+  - The setting is remembered in `~/.foamdxf-machine.json`.
+  - Tests: max rates parsed quietly (the slowest axis wins), the slider top
+    follows the controller, the move is sent at F = rapid, and the setting
+    is saved.

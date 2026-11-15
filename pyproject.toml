@@ -15,6 +15,7 @@ dev = [
     "ruff==0.17.4",
     "mypy==2.4.1",
     "types-PyYAML",
+    "types-pyserial",
 ]
 # Third-party libraries for each package. tests/step/ is skipped when any
 # library in the step group is not installed.
@@ -25,6 +26,7 @@ step = []
 dxf = [
     "PyYAML>=6",
     "ezdxf>=1.1",
+    "pyserial>=3.5",  # Machine tab: send G-code to grblHAL (foamdxf.sender)
 ]
 # Optional: STEP models in the DXF front end (foamdxf.step). tests/dxf/test_step.py
 # is skipped when gmsh is not installed or cannot load.

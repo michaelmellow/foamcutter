@@ -69,6 +69,7 @@ def test_preview_geometry_matches_the_program() -> None:
 @pytest.fixture
 def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-untyped-def]
     monkeypatch.setattr(gui, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr("foamdxf.machine.MACHINE_FILE", tmp_path / "machine.json")
     try:
         root = tk.Tk()
     except tk.TclError:
@@ -156,7 +157,7 @@ def test_align_tab_copies_and_shows_an_edge(window: SlicerWindow, tmp_path: Path
         window.vars[key].set(value)
     assert window.preview()
     buttons = [w for w in window.align_frame.winfo_children() if isinstance(w, ttk.Button)]
-    assert [b.cget("text") for b in buttons] == ["Copy G-code", "Show in 3D"] * 4
+    assert [b.cget("text") for b in buttons] == ["Copy G-code", "Show in 3D", "Go there"] * 4
     buttons[0].invoke()
     g = window.geometry
     assert g is not None

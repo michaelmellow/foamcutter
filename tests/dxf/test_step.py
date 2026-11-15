@@ -230,6 +230,7 @@ def test_pipeline_and_cli(tmp_path: Path, wing: Path, capsys: pytest.CaptureFixt
 @pytest.fixture
 def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SlicerWindow]:
     monkeypatch.setattr(gui, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr("foamdxf.machine.MACHINE_FILE", tmp_path / "machine.json")
     try:
         root = tk.Tk()
     except tk.TclError:

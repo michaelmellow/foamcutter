@@ -96,6 +96,7 @@ def test_saving_needs_readable_files(tmp_path: Path, inputs: dict[str, str]) -> 
 @pytest.fixture
 def window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SlicerWindow]:
     monkeypatch.setattr(gui, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr("foamdxf.machine.MACHINE_FILE", tmp_path / "machine.json")
     try:
         root = tk.Tk()
     except tk.TclError:
