@@ -469,3 +469,79 @@ queued in time).
   - Tests: max rates parsed quietly (the slowest axis wins), the slider top
     follows the controller, the move is sent at F = rapid, and the setting
     is saved.
+
+## 9. Kerf calibration tab (owner's request)
+
+A **Kerf** tab in the Machine tab's controls, beside Program, Jog and Home,
+so the DRO, Stop and the clickable section view stay in sight. Logic is in
+`src/foamdxf/kerfcal.py`, the tab in `src/foamdxf/kerftab.py`. The existing
+`foamcam/kerftest.py`, a fixed program that rapids back out through each
+slot, is unchanged.
+
+Decided with the owner:
+
+- **Speeds**: from target ÷ `max_speed_ratio` (the slowest the slower foam
+  face goes in a cut at that target) to target × 1.2, spaced evenly on a log
+  scale, rounded to whole mm/min. With target 150 and 5 slots: 50, 69, 95,
+  131, 180. The kerf lookup refuses speeds outside its table, so the table
+  has to cover that range. The list is editable. Start refuses a speed
+  above the profile's `max_rate` for the cut axes.
+- **Cut direction**: XZ+ / XZ− move both horizontal axes together (away
+  from / toward the operator); YA+ / YA− move both vertical axes (up / down).
+  The wire stays straight. Labels come from the profile's letters.
+  - **Next slot**: up or down after a horizontal slot, away or toward after
+    a vertical one, by the spacing.
+- **Sequence**, pausing at every stage. Each slot is a set of relative
+  programs, so jogging, dragging on the section, or swapping the scrap block
+  between slots simply moves the next start:
+  1. **Cut**. Before it: the wire must be straight (asks if not), the slot
+     must stay inside the travel, and the feed override is set back to
+     100 %. The confirmation asks for heat ON. The program is `G91 G94
+     G1 <both axes> F<speed>`, depth counted from where the wire starts.
+  2. When the motion has finished, a dialog asks to switch the heat OFF and
+     wait until the wire is cold. Cancel leaves a "Pull out (wire cold)"
+     button.
+  3. **Pull out** cold straight back along the slot, at the pull-out speed
+     (200 mm/min by default), then step to the next start. There is no step
+     after the last slot. The hot wire never runs back through a slot.
+  - A stopped cut leaves that slot to cut again or Skip. The wire has to be
+    taken out by jogging: its depth is unknown.
+- **Results**: slot widths at face 1 and face 2, averaged. If the faces
+  differ by more than 0.05 mm, the slot is flagged (first-cut-plan cut 1).
+  **Save to profile** appends a named table to `kerf_tables` as text:
+  - every comment and line stays as it was, and the file's own line endings
+    are kept;
+  - the result is checked by loading it, and a duplicate name is refused;
+  - a `.bak` copy is written first;
+  - the new table is selected for the next Preview.
+
+**Two fixes found on the way** (they affect the whole Machine tab):
+
+- **"Finished" now waits for the motion.** grblHAL answers `ok` once a line
+  is planned, not once it has moved. A program was reported finished while
+  its last moves were still running. That would have asked for heat OFF
+  mid-slot, and it also showed "switch the heat off" early after a normal
+  cut. Now `done` needs every line answered and then a status report saying
+  Idle with an empty planner (`Bf` free = planner size from `$I`). Until
+  then the program counts as running, so Stop still works and other
+  commands are refused.
+- **Axis letters without a Preview** now come from the profile (Z A X Y on
+  the real machine), not X Y Z A. Jog and Kerf drove the wrong letters
+  before a Preview.
+
+Verified by tests:
+- `tests/dxf/test_kerf.py`: speeds, parsing, slot and pull-out programs,
+  straight-wire and travel checks, face averaging, and appending a table
+  (comments kept, also when another key follows, duplicates refused);
+- `test_sender.py`: done waits for Idle with an empty planner;
+- a window test: 3 slots against a fake controller that tracks positions.
+  It checks:
+  - the override is reset to 100 %;
+  - each slot is cut, then a heat-off pause, a cold pull-out along the slot,
+    and a step up;
+  - the wire ends back at the first start, two spacings higher;
+  - widths are entered and averaged, and the table is saved, loadable, with
+    a `.bak` and selected.
+
+NOT verified: anything on the machine, in particular how long "done" takes
+after the last `ok` on the real board (status every 0.2 s).

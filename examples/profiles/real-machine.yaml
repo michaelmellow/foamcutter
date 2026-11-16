@@ -72,3 +72,16 @@ kerf_tables:
       - { speed: 120.0, kerf: 1.10 }
       - { speed: 240.0, kerf: 0.80 }
       - { speed: 480.0, kerf: 0.60 }
+  - name: "measured-2026-11-15"
+    description: "kerf calibration 2026-11-15: foam pyocelan 25, wire supply 3A"
+    points:
+      - { speed: 67.0, kerf: 3.500 }
+      - { speed: 126.0, kerf: 3.000 }
+      - { speed: 174.0, kerf: 2.000 }
+      - { speed: 240.0, kerf: 1.400 }
+  - name: "measured-2026-11-15hs"
+    description: "kerf calibration 2026-11-15: high speed, foam pyocelan 25, wire supply 3A"
+    points:
+      - { speed: 167.0, kerf: 2.000 }
+      - { speed: 230.0, kerf: 1.600 }
+      - { speed: 600.0, kerf: 1.400 }

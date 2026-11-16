@@ -246,6 +246,10 @@ class MachinePanel(ttk.Frame):
         self._error_held = False
         self._started = 0.0
         self._is_cut = False  # the running program is a cut (not a macro or an edge move)
+        self._block_name = ""  # name of the running program, macro or move
+        # called with (name, finished, message) when a run_block program ends: finished is
+        # False if it was stopped (Stop, error, alarm, reset or lost connection)
+        self.block_listeners: list[Callable[[str, bool, str], None]] = []
         self.jog_buttons: list[ttk.Button] = []
         self._following = False
         self._follow_target: dict[str, float] | None = None
@@ -529,6 +533,7 @@ class MachinePanel(ttk.Frame):
             return False
         self._error_held = False
         self._is_cut = cut
+        self._block_name = name
         self._started = time.monotonic()
         self.progress.configure(maximum=max(1, lines), value=0)
         self.progress_note.set(f"Sending {name}…")
@@ -833,6 +838,7 @@ class MachinePanel(ttk.Frame):
             self._write_log(f"--- {e.text}")
             self.say(f"Finished: {e.text}.")
             self._update_buttons()
+            self._block_ended(True, e.text)
         elif e.kind == "error":
             self._error_held = True
             self._write_log(f"--- {e.text}")
@@ -846,6 +852,26 @@ class MachinePanel(ttk.Frame):
             self._write_log(f"--- {e.text}")
             self.say(f"Stopped: {e.text}.")
             self._update_buttons()
+            self._block_ended(False, e.text)
+
+    def _block_ended(self, finished: bool, message: str) -> None:
+        name, self._block_name = self._block_name, ""
+        for listener in list(self.block_listeners):
+            listener(name, finished, message)
+
+    def work_position(self) -> dict[str, float] | None:
+        """Work position of each controller axis by letter, from the last status report."""
+        s = self.sender
+        if s is None or s.status is None or len(s.status.wpos) < len(CONTROLLER_AXES):
+            return None
+        return dict(zip(CONTROLLER_AXES, s.status.wpos, strict=False))
+
+    def reset_override(self) -> bool:
+        """Feed override back to 100 %. True if it was not 100 % (and was reset)."""
+        if self.sender is not None and self.sender.feed_override != 100:
+            self._override_to(100)
+            return True
+        return False
 
     def _show_status(self, st: Status) -> None:
         # the report lists the controller's axes in its own order (X Y Z A), whatever the profile maps

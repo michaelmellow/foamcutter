@@ -7,6 +7,7 @@ documents them.
 """
 
 import queue
+import re
 import threading
 import time
 
@@ -42,8 +43,13 @@ from foamdxf.sender import (
 
 
 class FakeGrbl:
-    def __init__(self, rx: int = 64, answer: bool = True, reject: str = "", alarm: str = "") -> None:
+    def __init__(self, rx: int = 64, answer: bool = True, reject: str = "", alarm: str = "",
+                 track: dict[str, float] | None = None) -> None:
         self.rx = rx
+        # track: start position by letter; moves (G90/G91 G0/G1, $J=) then change it. Without it the
+        # carriages report X = 1 + 0.1 per move run, Y Z A fixed (enough for the streaming tests)
+        self.pos = dict(track) if track is not None else None
+        self.relative = False
         self.answer = answer
         self.reject = reject  # a line answered with error:20
         self.alarm = alarm  # a line after which the controller raises ALARM:1
@@ -71,9 +77,13 @@ class FakeGrbl:
                 b = bytes([byte])
                 if b == b"?":
                     if self.answer:
-                        x = 1 + 0.1 * self.moves  # the carriages move 0.1 mm per move
-                        self.out += (f"<{self.state}|MPos:{x:.3f},2.000,3.000,4.000|Bf:100,{self.rx}|FS:0,0"
-                                     f"|Ov:{self.ov},100,100>\n").encode()
+                        if self.pos is not None:
+                            x, y, z, a = (self.pos[k] for k in "XYZA")
+                        else:
+                            x, y, z, a = 1 + 0.1 * self.moves, 2.0, 3.0, 4.0  # 0.1 mm per move
+                        free = 100 - self.planner  # planner blocks free ($I says 100)
+                        self.out += (f"<{self.state}|MPos:{x:.3f},{y:.3f},{z:.3f},{a:.3f}|Bf:{free},{self.rx}"
+                                     f"|FS:0,0|Ov:{self.ov},100,100>\n").encode()
                 elif 0x90 <= byte <= 0x94:  # feed override
                     self.realtime.append((b, self.state))
                     step = {0x90: 100 - self.ov, 0x91: 10, 0x92: -10, 0x93: 1, 0x94: -1}[byte]
@@ -124,6 +134,8 @@ class FakeGrbl:
         raw, self.buffer = self.buffer.split(b"\n", 1)
         line = raw.decode()
         self.lines.append(line)
+        if self.pos is not None:
+            self._move(line)
         if line == "$$":
             self.out += "".join(f"${n}={v:.3f}\n" for n, v in self.settings.items()).encode() + b"ok\n"
         elif line == "$I":
@@ -138,6 +150,23 @@ class FakeGrbl:
             if not line.startswith("$"):
                 self.planner += 1  # a move: the machine runs until the planner is empty
                 self.state = "Run"
+
+
+    def _move(self, line: str) -> None:
+        jog = line.startswith("$J=")
+        relative = self.relative
+        for word in line.split():
+            if word.endswith("G91"):
+                relative = True
+            elif word.endswith("G90"):
+                relative = False
+        if not jog:
+            self.relative = relative  # a jog's G90/G91 is for that jog only
+        if not (jog or line.startswith(("G0", "G1"))):
+            return
+        assert self.pos is not None
+        for letter, value in re.findall(r"([XYZA])(-?\d+(?:\.\d*)?)", line):
+            self.pos[letter] = self.pos[letter] + float(value) if relative else float(value)
 
 
 def program(n: int) -> str:
@@ -207,12 +236,13 @@ def test_streams_a_program_without_overfilling_the_buffer() -> None:
         text = program(300)
         total = s.run_program(text)
         events = collect(s, "done")
+        assert fake.planner == 0 and fake.state == "Idle", "done only once the moves have run, not when queued"
         assert total == 304
         assert fake.lines[:2] == ["$I", "$$"]  # what the sender asks at connect
         assert fake.lines[2:] == [line for _, line in program_lines(text)]  # all, in order
         assert fake.most > 64 - 30, "the buffer should actually fill, not one line at a time"
         progress = [e for e in events if e.kind == "progress"]
-        assert progress[-1].done == 303 and progress[-1].total == 304
+        assert progress[-1].done == 304 and progress[-1].total == 304  # every line answered, then done
         assert not s.running
     finally:
         s.close()
@@ -829,3 +859,91 @@ def test_section_speed_slider_reaches_rapids(window, tmp_path) -> None:  # type:
     import json
 
     assert json.loads((tmp_path / "machine.json").read_text())["mouse_feed"] == 400
+
+
+# --- Kerf tab: cut, wait for heat off, pull out cold, step; measure and save ------------
+
+
+def test_kerf_tab_runs_the_slots_and_saves_a_table(window, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    import shutil
+    from pathlib import Path
+
+    from foamcam.profile import load_profile
+
+    repo = Path(__file__).resolve().parents[2]
+    profile = tmp_path / "machine.yaml"
+    shutil.copy(repo / "examples/profiles/real-machine.yaml", profile)
+    window.vars["profile"].set(str(profile))
+    window.vars["speed"].set("150")
+    m, k = window.machine, window.kerf
+    assert str(k) in m.controls.tabs()
+
+    fake = FakeGrbl(rx=1024, track={"X": 50.0, "Y": 40.0, "Z": 50.0, "A": 40.0})  # wire straight
+
+    def connect(device: str) -> Sender:
+        s = Sender(fake, device)
+        s.start()
+        return s
+
+    m._connect = connect
+    m._ports = lambda: [("FAKE1", "fake grblHAL")]
+    m.refresh_ports()
+    m.connect()
+    pump(window, lambda: m.can_move())
+    m.sender.set_feed_override(150)
+    pump(window, lambda: fake.ov == 150)
+
+    asked: list[str] = []
+
+    def confirm(title: str, text: str, **_k: object) -> bool:
+        asked.append(title)
+        return True
+
+    monkeypatch.setattr("tkinter.messagebox.askokcancel", confirm)
+    monkeypatch.setattr("tkinter.messagebox.askyesno", lambda *a, **kw: pytest.fail("wire reported bent"))
+
+    k.target.set("150")
+    k.count.set("3")
+    k.generate()
+    assert k.speeds_text.get() == "50, 95, 180"
+    k.direction_label.set(k.dir_box.cget("values")[0])  # XZ+ : away from the operator
+    k._offset_labels()
+    k.depth.set("20")
+    k.spacing.set("10")
+    k.pullout.set("200")
+    k.start()
+    assert k.phase == "ready" and len(k.rows) == 3
+
+    for i, speed in enumerate((50, 95, 180)):
+        pump(window, lambda: k.phase == "ready" and k.cut_button.instate(["!disabled"]))
+        k.cut()
+        assert k.phase == "cutting"
+        last = i == 2
+        want = ("done" if last else "ready", i + 1)
+        pump(window, lambda want=want: (k.phase, k.current) == want)
+        cut = f"G1 Z20.000 X20.000 F{speed}"
+        assert cut in fake.lines
+        after = fake.lines[fake.lines.index(cut):]
+        assert "G1 Z-20.000 X-20.000 F200" in after  # pulled out cold along the slot
+        assert ("G1 A10.000 Y10.000 F200" in after) != last  # stepped up, except after the last slot
+    assert fake.ov == 100  # the override was set back to 100 % for the cuts
+    assert asked.count("Wire heat OFF") == 3  # the heat-off pause after every slot
+    assert [s for s in k.states] == ["cut", "cut", "cut"]
+    # back at the first slot's start, two spacings higher: each slot was pulled out to where it began
+    assert fake.pos == {"X": 50.0, "Y": 60.0, "Z": 50.0, "A": 60.0}
+
+    k.rows[0][0].set("1.80")
+    k.rows[0][1].set("1.84")
+    k.rows[1][0].set("1.2")
+    k.rows[2][0].set("0.9")
+    k.rows[2][1].set("1.0")
+    assert k.rows[0][2].get() == "1.820"
+    assert k.rows[2][2].get() == "0.950 !" and "Slot 3: faces differ" in k.warnings.get()
+    k.table_name.set("eps-test")
+    k.save()
+    table = load_profile(profile).kerf_tables["eps-test"]
+    assert [s for s, _ in table.points] == [50, 95, 180]
+    assert [k for _, k in table.points] == pytest.approx([1.82, 1.2, 0.95])
+    assert (tmp_path / "machine.yaml.bak").is_file()
+    assert window.vars["kerf_table"].get() == "eps-test"
+    assert m.disconnect()

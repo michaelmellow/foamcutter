@@ -22,11 +22,12 @@ from tkinter import filedialog, messagebox, ttk
 
 from foamcam.cam import CamResult
 from foamcam.errors import FoamcamError
-from foamcam.profile import load_profile
+from foamcam.profile import Profile, load_profile
 
 from .errors import DxfError
 from .holes import CHANNELS
 from .jobgen import CutSettings, Placement
+from .kerftab import KerfPanel
 from .machine import (
     MOUSE_FEED_FALLBACK_MAX,
     MOUSE_FEED_MIN,
@@ -226,7 +227,7 @@ class SlicerWindow:
         self.project_path: Path | None = None
         self.preview_values: dict[str, str] | None = None  # form values of the last good Preview
         self.live: Status | None = None  # last status report from the machine, None if not connected
-        self._travel_cache: tuple[tuple[str, float], dict[str, tuple[float, float]]] | None = None
+        self._profile_cache: tuple[tuple[str, float], Profile] | None = None
         self.view_zoom = 1.0  # section view: zoom and shift (canvas pixels) on top of the fit
         self.view_shift = (0.0, 0.0)
         self._pan_from = (0, 0)
@@ -673,6 +674,10 @@ class SlicerWindow:
         self._show_speed()
         self.canvas = tk.Canvas(self.section_frame, background="white", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.kerf = KerfPanel(self.machine.controls, self.machine, profile=self._profile,
+                              profile_path=lambda: Path(self.vars["profile"].get().strip()),
+                              target=lambda: self.vars["speed"].get(), saved=self._kerf_saved)
+        self.machine.controls.add(self.kerf, text="Kerf")
         self.machine.views.insert(0, self.section_frame, text="Section")
         self.machine.views.select(self.section_frame)  # type: ignore[no-untyped-call]
         report_frame = ttk.Frame(tabs)
@@ -786,20 +791,33 @@ class SlicerWindow:
             "  - the work zero is the one this job was made for")):
             self.tabs.select(self.machine)  # type: ignore[no-untyped-call]
 
-    def _travel(self) -> dict[str, tuple[float, float]] | None:
-        """Each axis letter's (min, max) from the machine profile in the form, or None."""
+    def _profile(self) -> Profile | None:
+        """The machine profile in the form (read again when the file changes), or None."""
         path = Path(self.vars["profile"].get().strip())
         try:
             key = (str(path), path.stat().st_mtime)
-            if self._travel_cache is None or self._travel_cache[0] != key:
-                profile = load_profile(path)
-                self._travel_cache = (key, {a.letter: (a.min, a.max) for a in profile.axes})
+            if self._profile_cache is None or self._profile_cache[0] != key:
+                self._profile_cache = (key, load_profile(path))
         except (OSError, FoamcamError):
             return None
-        return dict(self._travel_cache[1])
+        return self._profile_cache[1]
+
+    def _travel(self) -> dict[str, tuple[float, float]] | None:
+        """Each axis letter's (min, max) from the machine profile in the form, or None."""
+        profile = self._profile()
+        return None if profile is None else {a.letter: (a.min, a.max) for a in profile.axes}
+
+    def _kerf_saved(self, name: str) -> None:
+        """A new kerf table was written to the profile: offer it and select it."""
+        self._load_kerf_tables()
+        self.vars["kerf_table"].set(name)
 
     def _letters(self) -> tuple[str, str, str, str]:
-        return self.geometry.letters if self.geometry is not None else ("X", "Y", "Z", "A")
+        """G-code letters of axes 1 to 4: from the preview, else the profile, else X Y Z A."""
+        if self.geometry is not None:
+            return self.geometry.letters
+        profile = self._profile()
+        return profile.letters if profile is not None else ("X", "Y", "Z", "A")
 
     def _copy_edge(self, edge: AlignEdge) -> None:
         text = "\n".join(edge.gcode)

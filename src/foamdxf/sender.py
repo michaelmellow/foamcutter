@@ -96,7 +96,8 @@ class Event:
     - connected: the controller answered (text: device). lost: the connection failed or
       the controller never answered; disconnected follows. disconnected: port released.
     - status: a status report (status). log: a line from the controller. sent: a command line sent.
-    - progress: program lines answered (done, total). done: the program finished.
+    - progress: program lines answered (done, total). done: the program finished: every line
+      answered and then a status report saying Idle with nothing left in the planner.
     - error: the controller rejected a program line; it is held and only Stop is possible.
     - stopped: the program ended before its end (stop, alarm, reset or lost connection).
     """
@@ -227,6 +228,7 @@ class _Job:
     done: int = 0
     failed: str = ""  # set on the first error: nothing more is sent
     stopping: float = 0.0  # time the stop began (feed hold sent), 0 if not stopping
+    acked: float = 0.0  # time the last line was answered: then wait for the motion to end
     started: float = field(default_factory=time.monotonic)
 
 
@@ -426,6 +428,19 @@ class Sender:
                     self.feed_override = arg
                     self._ov_changed = self._clock()
 
+    def _check_finished(self) -> None:
+        """Emit "done" when every line is answered and the machine has stopped moving."""
+        job, st = self._job, self.status
+        if job is None or not job.acked or job.stopping or job.failed or st is None:
+            return
+        if self._status_at <= job.acked or st.state != "Idle":
+            return
+        if st.buffer is not None and self.planner_size is not None and st.buffer[0] < self.planner_size:
+            return  # moves still queued
+        self._job = None
+        minutes = (self._clock() - job.started) / 60
+        self._emit("done", f"{job.label} finished in {minutes:.1f} min", done=job.done, total=len(job.lines))
+
     def _check_stop(self, now: float) -> None:
         job = self._job
         if job is None or not job.stopping:
@@ -500,6 +515,7 @@ class Sender:
                 self._answered = True
                 self._emit("connected", self.device)
             self._emit("status", status=self.status)
+            self._check_finished()
         elif text == "ok" or text.startswith("error"):
             self._answer(text)
         elif text.startswith("ALARM"):
@@ -549,12 +565,11 @@ class Sender:
             return
         if text == "ok":
             job.done += 1
+            self._emit("progress", done=job.done, total=len(job.lines))
             if job.done == len(job.lines) and not job.failed:
-                self._job = None
-                minutes = (self._clock() - job.started) / 60
-                self._emit("done", f"{job.label} finished in {minutes:.1f} min", done=job.done, total=len(job.lines))
-            else:
-                self._emit("progress", done=job.done, total=len(job.lines))
+                # "ok" means planned, not moved: the program has finished once a later report
+                # says Idle with an empty planner (see _check_finished)
+                job.acked = self._clock()
             return
         if not job.failed:
             job.failed = f"{text} on line {item.number} ({item.line})"
