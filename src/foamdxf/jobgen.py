@@ -21,12 +21,12 @@ than `min_te_thickness` (default 0.6 mm, as in the worked examples): a sharp
 trailing edge is a corner too sharp for kerf compensation (§10.7 step 8).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from foamcam.profile import Profile
 
 from .errors import DxfError
-from .holes import CHANNELS, HolePair, pair_holes
+from .holes import CHANNELS, ChannelSpec, HolePair, pair_holes
 from .outline import DxfOutline, Point
 
 
@@ -48,12 +48,19 @@ class CutSettings:
     max_segment_length: float = 1.0
     min_te_thickness: float = 0.6  # opens a sharp trailing edge to a face the kerf can follow
     channel: str = "shortest"  # side the wire enters each hole from: "shortest", "upper" or "lower"
+    channels: dict[str, ChannelSpec] = field(default_factory=dict)  # drawn channels by hole name
+    # how the wire leaves a hole's channel (job-file.md §10.4): "rapid", "cut" (at cut_speed,
+    # field left out) or a speed in mm/min
+    channel_exit: str | float = "rapid"
 
 
 @dataclass(frozen=True)
 class GeneratedJob:
     text: str
     summary: tuple[str, ...]
+    holes: tuple[HolePair, ...] = ()  # in the drawing frame
+    shift: tuple[float, float] = (0.0, 0.0)  # drawing frame + shift = machine (work) frame
+    outers: tuple[tuple[Point, ...], tuple[Point, ...]] = ((), ())  # root, tip outer contours as drawn
 
 
 def build_job(
@@ -97,9 +104,10 @@ def build_job(
     else:
         try:
             holes = pair_holes(root.points, root.holes, tip.points, tip.holes,
-                               settings.channel, settings.max_segment_length)
+                               settings.channel, settings.max_segment_length, settings.channels)
         except DxfError as error:
             problems.append(str(error))
+    exit_line = channel_exit_line(settings.channel_exit, problems)
     if problems:
         raise DxfError("cannot build the job:\n" + "\n".join(f"  - {p}" for p in problems))
 
@@ -137,13 +145,14 @@ def build_job(
         f"lead_in: {_num(placement.lead_in)}",
         f"safe_position: [{_num(x_entry)}, {_num(z_safe)}, {_num(x_entry)}, {_num(z_safe)}]",
         "mirror: false",
+        *exit_line,
         (
             f"block: {{ x: {_num(block_x)}, length: {_num(placement.stock_length)}, "
             f"height: {_num(placement.stock_height)} }}"
         ),
     ]
-    lines += _section("root", root, dx, dz, y_root, [(h.name, h.slit, h.root) for h in holes])
-    lines += _section("tip", tip, dx, dz, y_tip, [(h.name, h.slit, h.tip) for h in holes])
+    lines += _section("root", root, dx, dz, y_root, [(h.name, h.slit, h.root, h.root_channel) for h in holes])
+    lines += _section("tip", tip, dx, dz, y_tip, [(h.name, h.slit, h.tip, h.tip_channel) for h in holes])
 
     summary = (
         f"root {root.source}: chord {root.chord:.1f} mm; tip {tip.source}: chord {tip.chord:.1f} mm",
@@ -161,15 +170,51 @@ def build_job(
         ),
         f"safe position [{x_entry:.1f}, {z_safe:.1f}, {x_entry:.1f}, {z_safe:.1f}]",
     ) + tuple(
-        f"{h.name}: {len(h.root)} points, channel from the {h.slit} side, "
+        f"{h.name}: {len(h.root)} points, {_channel_kind(h)} from the {h.slit} side, "
         f"{h.channel_lengths[0]:.1f} mm (root) / {h.channel_lengths[1]:.1f} mm (tip) long"
         for h in holes
-    )
-    return GeneratedJob("\n".join(lines) + "\n", summary)
+    ) + ((f"channel exit: {_exit_text(settings.channel_exit, settings.cut_speed)}",) if holes else ())
+    return GeneratedJob("\n".join(lines) + "\n", summary, tuple(holes), (dx, dz), (root.points, tip.points))
+
+
+def channel_exit_line(value: str | float, problems: list[str]) -> list[str]:
+    """The job's channel_exit line (§3): none for "cut", which is the CAM's default."""
+    if value == "rapid":
+        return ['channel_exit: "rapid"']
+    if value == "cut":
+        return []
+    if isinstance(value, str):
+        problems.append('channel exit must be "rapid", "cut" or a speed in mm/min')
+        return []
+    if not value > 0:
+        problems.append("channel exit speed must be more than 0")
+        return []
+    return [f"channel_exit: {_num(value)}"]
+
+
+def _channel_kind(h: HolePair) -> str:
+    if h.spec.shape == "straight":
+        return f"straight channel at {h.spec.angle:g} degrees"
+    if h.spec.shape == "curved":
+        return f"curved channel ({len(h.root_channel) - 1} bend points) out at {h.spec.angle:g} degrees"
+    return "channel"
+
+
+def _exit_text(value: str | float, cut_speed: float) -> str:
+    if value == "rapid":
+        return "rapid (G0) out of each channel once the hole is cut"
+    if value == "cut":
+        return f"at the cut speed ({cut_speed:g} mm/min)"
+    return f"at {value:g} mm/min"
 
 
 def _section(
-    label: str, outline: DxfOutline, dx: float, dz: float, y: float, features: list[tuple[str, str, tuple[Point, ...]]]
+    label: str,
+    outline: DxfOutline,
+    dx: float,
+    dz: float,
+    y: float,
+    features: list[tuple[str, str, tuple[Point, ...], tuple[Point, ...]]],
 ) -> list[str]:
     le = outline.points[outline.le_index]
     chord = outline.chord
@@ -184,9 +229,12 @@ def _section(
     ]
     if features:  # §8: points in mm, origin at the leading edge
         out.append("  features:")
-        for name, slit, pts in features:
+        for name, slit, pts, channel in features:
             out += [f"    - name: {_quote(name)}", '      kind: "hole"', f"      slit: {_quote(slit)}", "      points:"]
             out += [f"        - [{x - le[0]:.6f}, {z - le[1]:.6f}]" for x, z in pts]
+            if channel:
+                out.append("      channel:")
+                out += [f"        - [{x - le[0]:.6f}, {z - le[1]:.6f}]" for x, z in channel]
     return out
 
 

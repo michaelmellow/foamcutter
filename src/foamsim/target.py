@@ -25,7 +25,8 @@ class SectionTarget:
     outer: Arr  # closed polygon
     holes: dict[str, Arr] = field(default_factory=dict)  # closed polygons
     opens: dict[str, Arr] = field(default_factory=dict)  # polylines
-    slits: dict[str, Arr] = field(default_factory=dict)  # [first point, slit point]
+    # [first point, channel points..., slit point]: the slit or channel as cut (section 8)
+    slits: dict[str, Arr] = field(default_factory=dict)
 
 
 def contour_uv(raw: Sequence[Point], chord: float, min_te_thickness: float) -> list[Point]:
@@ -119,6 +120,44 @@ def _slit_point(
     return (u0, v0 + sign * dist), pos
 
 
+def _channel_slit_point(
+    contour: list[Point], i_le: int, first: Point, channel: Sequence[Point], side: str
+) -> tuple[Point, float] | str:
+    """Section 8 channels: the slit point and its position along the contour, or
+    what is wrong with the channel."""
+    poly = as_array(contour)
+    if len(channel) > 1 and not bool(np.all(inside(as_array(channel[:-1]), poly))):
+        return "leaves the outer contour before its last point"
+    if bool(inside(as_array(channel[-1:]), poly)[0]):
+        return "must end outside the outer contour"
+    pts = [first, *channel]
+    n = len(contour)
+    for k in range(len(pts) - 2):  # every segment but the last stays inside
+        for j in range(n):
+            if segments_intersect(np.array(pts[k], dtype=float), np.array(pts[k + 1], dtype=float),
+                                  poly[j], poly[(j + 1) % n]):
+                return "crosses the outer contour before its last segment"
+    (ua, va), (ub, vb) = pts[-2], pts[-1]
+    best: tuple[float, int, float] | None = None  # (fraction along the last segment, edge, fraction)
+    for j in range(n):
+        (pa, qa), (pb, qb) = contour[j], contour[(j + 1) % n]
+        du, dv, eu, ev = ub - ua, vb - va, pb - pa, qb - qa
+        den = du * ev - dv * eu
+        if den == 0:
+            continue
+        t = ((pa - ua) * ev - (qa - va) * eu) / den
+        s = ((pa - ua) * dv - (qa - va) * du) / den
+        if 0 <= t <= 1 and 0 <= s <= 1 and (best is None or t < best[0]):
+            best = (t, j, s)
+    if best is None:
+        return "does not meet the outer contour"
+    t, j, s = best
+    pos = j + s
+    if (side == "upper" and not pos <= i_le) or (side == "lower" and not i_le <= pos <= n - 1):
+        return f"does not meet the {side} side"
+    return (ua + t * (ub - ua), va + t * (vb - va)), pos
+
+
 def _self_crossing(polygon: Arr) -> bool:
     a, b = segments(polygon, closed=True)
     keep = [i for i in range(len(a)) if not np.array_equal(a[i], b[i])]
@@ -189,7 +228,14 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
                     closed and bool(np.any(inside(other, placed)))
                 ) or (other_name in target.holes and bool(np.any(inside(placed, other)))):
                     errors.append(f'{p}: touches the feature "{other_name}"')
-            hit = _slit_point(contour, i_le, f.points[0], f.slit)
+            if f.channel:
+                found = _channel_slit_point(contour, i_le, f.points[0], f.channel, f.slit)
+                if isinstance(found, str):
+                    errors.append(f"{p}.channel: the channel {found}")
+                    continue
+                hit: tuple[Point, float] | None = found
+            else:
+                hit = _slit_point(contour, i_le, f.points[0], f.slit)
             if hit is None:
                 errors.append(
                     f"{p}.slit: the slit from the first point does not meet the {f.slit} side"
@@ -198,9 +244,13 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
             slit_point, pos = hit
             positions.append((pos if job.direction == "upper_first" else -pos, f.name))
             (target.holes if closed else target.opens)[f.name] = placed
-            target.slits[f.name] = np.vstack(
-                [placed[0], _place_section([slit_point], s)[0]]
+            target.slits[f.name] = _place_section(
+                [f.points[0], *f.channel[:-1], slit_point], s
             )
+        for name, slit in target.slits.items():  # a channel must not cut into another feature
+            for other_name, other in [*target.holes.items(), *target.opens.items()]:
+                if other_name != name and _crosses(slit, False, other, other_name in target.holes):
+                    errors.append(f'{s.label}: the slit of "{name}" crosses the feature "{other_name}"')
         order[s.label] = [name for _, name in sorted(positions)]
         targets[s.label] = target
 

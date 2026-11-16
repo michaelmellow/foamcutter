@@ -36,6 +36,19 @@ def pair(text: str) -> tuple[float, float]:
     return a, b
 
 
+def channel_exit(text: str) -> str | float:
+    """--channel-exit: "rapid", "cut" or a speed in mm/min."""
+    if text in ("rapid", "cut"):
+        return text
+    try:
+        speed = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError('use "rapid", "cut" or a speed in mm/min') from None
+    if speed <= 0:
+        raise argparse.ArgumentTypeError("the speed must be more than 0")
+    return speed
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m foamdxf",
@@ -58,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--direction", choices=("upper_first", "lower_first"), default="upper_first")
     p.add_argument("--channel", choices=CHANNELS, default="shortest",
                    help="side the wire enters each inner contour (hole) from (default: the shorter channel)")
+    p.add_argument("--channel-exit", type=channel_exit, default="rapid", metavar="rapid|cut|MM_PER_MIN",
+                   help="how the wire leaves a hole's channel once the hole is cut: rapid (default), cut "
+                        "(at the cut speed) or a speed in mm/min")
     p.add_argument("--lead-in", type=float, default=20.0, help="clearance in front of the stock, mm (default 20)")
     p.add_argument("--block-x", type=float, help="G54 x of the stock's back face (default: centred in travel)")
     p.add_argument("--safe-clearance", type=float, default=20.0,
@@ -115,7 +131,8 @@ def main(argv: list[str] | None = None) -> int:
         profile=args.profile,
         placement=Placement(args.span or 0.0, args.stock[0], args.stock[1], args.block_x, args.lead_in,
                             args.safe_clearance),
-        settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te, args.channel),
+        settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te, args.channel,
+                             channel_exit=args.channel_exit),
         name=args.name,
         simplify=args.simplify,
         faces=faces,

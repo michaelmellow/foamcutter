@@ -4,6 +4,7 @@ Rules that need geometry or the machine profile are checked in `sections` and
 `cam`, which report through the same ValidationError.
 """
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .errors import ValidationError
 from .fields import Reader, load_yaml, parse_yaml
 
 WHAT = "job file"
+RAPID = math.inf  # Job.channel_exit for channel_exit: "rapid"
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,7 @@ class Feature:
     kind: str  # "hole" or "open"
     slit: str  # "upper" or "lower"
     points: tuple[Point, ...]  # mm, untwisted section frame
+    channel: tuple[Point, ...] = ()  # §8 channel: the slit's path from points[0] outward; () = straight
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ class Job:
     block: Block
     root: Section
     tip: Section
+    channel_exit: float = 0.0  # §10.4: 0 = at cut_speed, RAPID = G0, else mm/min at the faster face
 
 
 TOP_FIELDS = {
@@ -76,7 +80,7 @@ def load_job_text(text: str, base_dir: Path | str) -> Job:
 
 def parse_job(data: Any, base_dir: Path) -> Job:
     r = Reader()
-    top = r.mapping(data, "", TOP_FIELDS)
+    top = r.mapping(data, "", TOP_FIELDS, frozenset({"channel_exit"}))
     if "format" in top and top["format"] != "foamcutter-job":
         r.problem("format", 'must be "foamcutter-job"')
     r.integer(top, "version", "", equal=1)
@@ -114,9 +118,23 @@ def parse_job(data: Any, base_dir: Path) -> Job:
         block=block,
         root=root if root is not None else empty_section("root"),
         tip=tip if tip is not None else empty_section("tip"),
+        channel_exit=read_channel_exit(r, top),
     )
     r.raise_if_problems(WHAT)
     return job
+
+
+def read_channel_exit(r: Reader, top: dict[str, Any]) -> float:
+    """§3 channel_exit: "rapid", a speed > 0, or absent (0: at cut_speed)."""
+    if "channel_exit" not in top:
+        return 0.0
+    value = top["channel_exit"]
+    if value == "rapid":
+        return RAPID
+    if isinstance(value, str):
+        r.problem("channel_exit", 'must be "rapid" or a number greater than 0')
+        return 0.0
+    return r.number_value(value, "channel_exit", gt=0)
 
 
 def read_section(r: Reader, data: Any, label: str, base_dir: Path) -> Section:
@@ -144,15 +162,16 @@ def read_section(r: Reader, data: Any, label: str, base_dir: Path) -> Section:
     names: set[str] = set()
     for i, raw in enumerate(r.sequence(s, "features", label)):
         path = f"{label}.features[{i}]"
-        f = r.mapping(raw, path, {"name", "kind", "slit", "points"})
+        f = r.mapping(raw, path, {"name", "kind", "slit", "points"}, frozenset({"channel"}))
         name = r.text(f, "name", path, nonempty=True)
         kind = r.text(f, "kind", path, choices=("hole", "open"))
         slit = r.text(f, "slit", path, choices=("upper", "lower"))
         points = r.points(f, "points", path, min_length=3 if kind == "hole" else 2)
+        channel = r.points(f, "channel", path, min_length=1) if "channel" in f else []
         if name in names:
             r.problem(f"{path}.name", f'"{name}" is used by more than one feature')
         names.add(name)
-        features.append(Feature(name, kind, slit, tuple(points)))
+        features.append(Feature(name, kind, slit, tuple(points), tuple(channel)))
 
     return Section(
         label=label,
@@ -183,6 +202,11 @@ def check_section_pair(r: Reader, root: Section, tip: Section) -> None:
             r.problem("tip.features", f'feature "{name}": slit differs from the root')
         if len(a.points) != len(b.points):
             r.problem("tip.features", f'feature "{name}": {len(b.points)} points at the tip, {len(a.points)} at the root')
+        if len(a.channel) != len(b.channel):
+            r.problem(
+                "tip.features",
+                f'feature "{name}": {len(b.channel)} channel points at the tip, {len(a.channel)} at the root',
+            )
 
 
 def empty_section(label: str) -> Section:

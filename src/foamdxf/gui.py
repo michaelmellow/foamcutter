@@ -17,15 +17,26 @@ import subprocess
 import sys
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from foamcam.cam import CamResult
 from foamcam.errors import FoamcamError
+from foamcam.geometry import inside
 from foamcam.profile import Profile, load_profile
 
 from .errors import DxfError
-from .holes import CHANNELS
+from .holes import (
+    CHANNELS,
+    SHAPES,
+    ChannelSpec,
+    HolePair,
+    area_centre,
+    preview_channels,
+    specs_from_text,
+    specs_to_text,
+)
 from .jobgen import CutSettings, Placement
 from .kerftab import KerfPanel
 from .machine import (
@@ -87,6 +98,8 @@ CUT_FIELDS = [
 DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
 DEFAULTS |= {"channel": "shortest"}  # side the wire enters inner contours (holes) from
+# how the wire leaves a hole's channel ("rapid", "cut" or mm/min), and the drawn channels (JSON, holes.py)
+DEFAULTS |= {"channel_exit": "rapid", "channels": ""}
 # STEP workflow: source "step" uses the model and two of its flat faces (numbers) instead of the DXFs
 DEFAULTS |= {"source": "dxf", "step": "", "root_face": "", "tip_face": ""}
 # which stock values were typed last ("absolute" or "margin"): kept when the outlines change
@@ -159,6 +172,19 @@ def request_from_form(values: dict[str, str]) -> Request:
         lead_in=req("lead_in", labels["lead_in"]),
         safe_clearance=req("safe_clearance", labels["safe_clearance"]),
     )
+    exit_text = values.get("channel_exit", "rapid").strip().lower() or "rapid"
+    channel_exit: str | float = exit_text
+    if exit_text not in ("rapid", "cut"):
+        try:
+            channel_exit = float(exit_text)
+        except ValueError:
+            raise FormError('Channel exit: "rapid", "cut" or a speed in mm/min') from None
+        if channel_exit <= 0:
+            raise FormError("Channel exit: the speed must be more than 0")
+    try:
+        channels = specs_from_text(values.get("channels", ""))
+    except DxfError as error:
+        raise FormError(f"Hole channels: {error}") from None
     settings = CutSettings(
         cut_speed=req("speed", labels["speed"]),
         kerf_table=values.get("kerf_table", "").strip() or None,
@@ -166,6 +192,8 @@ def request_from_form(values: dict[str, str]) -> Request:
         max_segment_length=req("segment", labels["segment"]),
         min_te_thickness=req("min_te", labels["min_te"]),
         channel=values.get("channel", "shortest"),
+        channels=channels,
+        channel_exit=channel_exit,
     )
     return Request(
         root=paths["root"],
@@ -183,6 +211,8 @@ LEGEND_HEIGHT = 76  # the section view's legend: two columns of four lines
 ZOOM_STEP = 1.2  # per wheel notch
 ZOOM_RANGE = (0.2, 50.0)
 DRAG_PIXELS = 4  # a left press that moves further than this is a drag, not a click
+HANDLE_PIXELS = 9  # a press this close to a channel handle grabs it
+CHANNEL_PREVIEW_MS = 400  # after a channel edit, wait this long before running the CAM again
 
 
 def _legend_slot(i: int) -> tuple[float, float]:
@@ -236,6 +266,9 @@ class SlicerWindow:
         self._dragging = False
         self.keys_down: set[str] = set()
         self.move_target: tuple[float, float, tuple[int, ...]] | None = None  # x, z, towers last asked for
+        self.channel_handles: dict[tuple[str, str], tuple[float, float]] = {}  # (hole, "entry"/"angle"): canvas
+        self._channel_drag: tuple[str, str] | None = None
+        self._channel_after: str | None = None
         self.saved_values: dict[str, str] = {}
         self.step_model: StepModel | None = None
         self._step_pending = False
@@ -450,7 +483,10 @@ class SlicerWindow:
         ttk.Label(cut, text="Hole channel from").grid(row=2, column=0, sticky="w", pady=2)
         ttk.Combobox(cut, textvariable=self.vars["channel"], state="readonly", width=22,
                      values=CHANNELS).grid(row=2, column=1, columnspan=2, sticky="we", padx=4)
-        self._number_rows(cut, CUT_FIELDS, first_row=3)
+        ttk.Label(cut, text="Channel exit").grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Entry(cut, textvariable=self.vars["channel_exit"], width=10).grid(row=3, column=1, sticky="we", padx=4)
+        ttk.Label(cut, text="rapid, cut or mm/min", foreground="#5f6368").grid(row=3, column=2, sticky="w")
+        self._number_rows(cut, CUT_FIELDS, first_row=4)
 
         out = ttk.LabelFrame(form, text="Output", padding=6)
         out.pack(fill=tk.X, pady=(8, 0))
@@ -657,9 +693,13 @@ class SlicerWindow:
         self.section_frame = ttk.Frame(self.machine.views)
         bar = ttk.Frame(self.section_frame, padding=(4, 2))
         bar.pack(fill=tk.X)
+        self.section_bar = bar
         self.mouse_moves = tk.BooleanVar(value=False)  # not remembered: a stray click must not move the wire
         ttk.Checkbutton(bar, text="Mouse moves the wire", variable=self.mouse_moves,
                         command=self._mouse_moves_changed).pack(side=tk.LEFT)
+        self.edit_channels = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Edit channels", variable=self.edit_channels,
+                        command=self._edit_channels_changed).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(bar, text="Speed").pack(side=tk.LEFT, padx=(14, 4))
         self.speed_scale = tk.Scale(bar, from_=MOUSE_FEED_MIN, to=MOUSE_FEED_FALLBACK_MAX, resolution=50,
                                     orient=tk.HORIZONTAL, length=220, showvalue=False,
@@ -668,6 +708,7 @@ class SlicerWindow:
         self.speed_text = tk.StringVar()
         ttk.Label(bar, textvariable=self.speed_text, width=26).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(bar, text="Fit view", command=self.fit_view).pack(side=tk.LEFT, padx=8)
+        self._build_channel_bar()
         ttk.Label(self.section_frame, foreground="#5f6368", padding=(4, 0), text=(
             "wheel zoom · right-drag pan · click: both towers · X or Z + click: that tower · drag: towers follow"
             )).pack(anchor="w")
@@ -906,8 +947,10 @@ class SlicerWindow:
         if names and self.vars["kerf_table"].get() not in names:
             self.vars["kerf_table"].set(names[0])
 
-    def preview(self) -> bool:
-        """Build the job and run the CAM. Returns True if the cut is valid."""
+    def preview(self, quiet: bool = False) -> bool:
+        """Build the job and run the CAM. Returns True if the cut is valid. `quiet` (after a
+        channel edit): on failure keep showing the last good cut and only report in the status."""
+        before = (self.plan, self.result, self.geometry, self.preview_values)
         self.plan = self.result = self.geometry = None
         self.preview_values = None
         self.playing = False
@@ -920,6 +963,12 @@ class SlicerWindow:
             self.result = run_cam(self.plan)
             self.geometry = preview_geometry(self.plan, self.result)
         except (FormError, DxfError, FoamcamError) as error:
+            if quiet and before[0] is not None:
+                self.plan, self.result, self.geometry, self.preview_values = before
+                self.status.set("Cannot cut this channel: " + " ".join(str(error).split())[:300]
+                                + "  (the view shows the last good cut)")
+                self.draw()
+                return False
             self._show_report(self._plan_text() + "\nERROR\n" + str(error))
             self.status.set("Error: " + str(error).splitlines()[0])
             self.tabs.select(self.report_frame)  # type: ignore[no-untyped-call]
@@ -1087,6 +1136,8 @@ class SlicerWindow:
         c.create_line(*self._to_canvas(g.tip_cut), fill=COLOURS["tip"], width=2)
         for target in (g.root_target, g.tip_target, *g.root_holes, *g.tip_holes):
             c.create_line(*self._to_canvas(target + target[:1]), fill=COLOURS["target"], width=1)
+        if self.edit_channels.get():
+            self._draw_channels()
 
         # coordinates at the corners of the view (x runs right to left)
         x0, z0, x1, z1 = self._view_box()
@@ -1160,6 +1211,213 @@ class SlicerWindow:
         if self.result is not None:
             self.status.set(f"x {x:7.1f}  z {z:7.1f} mm      cut time {self.result.total_time:.2f} min")
 
+    # --- section view: drawing the hole channels ---------------------------------------
+
+    def _build_channel_bar(self) -> None:
+        """The row of channel settings shown under the section toolbar while editing."""
+        bar = ttk.Frame(self.section_frame, padding=(4, 0, 4, 2))
+        self.channel_bar = bar
+        self.ch_vars = {k: tk.StringVar(value=v) for k, v in (
+            ("hole", ""), ("shape", "auto"), ("angle", "90"), ("offset", "0"), ("entry", "90"), ("radius", "5"))}
+        ttk.Label(bar, text="Hole").pack(side=tk.LEFT)
+        self.ch_hole_box = ttk.Combobox(bar, textvariable=self.ch_vars["hole"], state="readonly", width=7)
+        self.ch_hole_box.pack(side=tk.LEFT, padx=(2, 8))
+        self.ch_hole_box.bind("<<ComboboxSelected>>", lambda _e: self._load_channel_fields())
+        ttk.Label(bar, text="Shape").pack(side=tk.LEFT)
+        shape = ttk.Combobox(bar, textvariable=self.ch_vars["shape"], state="readonly", width=8, values=SHAPES)
+        shape.pack(side=tk.LEFT, padx=(2, 8))
+        shape.bind("<<ComboboxSelected>>", lambda _e: self._channel_shape_changed())
+        self.ch_spins: dict[str, ttk.Spinbox] = {}
+        for key, label, lo, hi, step in (("angle", "Angle °", -360, 360, 5), ("offset", "Offset mm", -100, 100, 0.5),
+                                         ("entry", "Entry °", -360, 360, 5), ("radius", "Bend mm", 0.5, 200, 0.5)):
+            ttk.Label(bar, text=label).pack(side=tk.LEFT)
+            spin = ttk.Spinbox(bar, textvariable=self.ch_vars[key], from_=lo, to=hi, increment=step, width=6,
+                               command=self._channel_fields_changed)
+            spin.pack(side=tk.LEFT, padx=(2, 8))
+            spin.bind("<Return>", lambda _e: self._channel_fields_changed())
+            spin.bind("<FocusOut>", lambda _e: self._channel_fields_changed())
+            self.ch_spins[key] = spin
+        ttk.Button(bar, text="Reset", command=self._reset_channel).pack(side=tk.LEFT)
+
+    def _channel_pairs(self) -> tuple[HolePair, ...]:
+        return self.plan.generated.holes if self.plan is not None else ()
+
+    def _channel_specs(self) -> dict[str, ChannelSpec]:
+        try:
+            return specs_from_text(self.vars["channels"].get())
+        except DxfError:
+            return {}
+
+    def _edit_channels_changed(self) -> None:
+        if self.edit_channels.get():
+            self.mouse_moves.set(False)
+            self.channel_bar.pack(fill=tk.X, after=self.section_bar)
+            names = [p.name for p in self._channel_pairs()]
+            self.ch_hole_box.configure(values=names)
+            if names and self.ch_vars["hole"].get() not in names:
+                self.ch_vars["hole"].set(names[0])
+            self._load_channel_fields()
+            self.status.set(
+                "Edit channels: click a hole to pick it, drag the round handle along the hole and the square one "
+                "to turn the channel; the cut is worked out again when you let go."
+                if names else "Edit channels: press Preview first; the drawings have no holes yet.")
+        else:
+            self.channel_bar.pack_forget()
+        self.draw()
+
+    def _channel_spec(self) -> ChannelSpec:
+        """The spec in the channel fields (the stored one where a field is not a number)."""
+        old = self._channel_specs().get(self.ch_vars["hole"].get(), ChannelSpec())
+        values = {}
+        for key in ("angle", "offset", "entry", "radius"):
+            number = _number(self.ch_vars[key].get())
+            values[key] = getattr(old, key) if number is None else number
+        return ChannelSpec(self.ch_vars["shape"].get(), values["angle"], values["offset"], values["entry"],
+                           max(values["radius"], 0.1))
+
+    def _load_channel_fields(self) -> None:
+        spec = self._channel_specs().get(self.ch_vars["hole"].get(), ChannelSpec())
+        self._show_channel_spec(spec)
+        self.draw()
+
+    def _show_channel_spec(self, spec: ChannelSpec) -> None:
+        self.ch_vars["shape"].set(spec.shape)
+        for key in ("angle", "offset", "entry", "radius"):
+            self.ch_vars[key].set(f"{getattr(spec, key):g}")
+        for key, spin in self.ch_spins.items():
+            used = (spec.shape == "straight" and key in ("angle", "offset")) or (
+                spec.shape == "curved" and key in ("angle", "entry", "radius"))
+            spin.state(["!disabled"] if used else ["disabled"])
+
+    def _channel_shape_changed(self) -> None:
+        """A new shape starts from where the automatic channel was: up or down out of the hole."""
+        name, shape = self.ch_vars["hole"].get(), self.ch_vars["shape"].get()
+        old = self._channel_specs().get(name, ChannelSpec())
+        pair = next((p for p in self._channel_pairs() if p.name == name), None)
+        up = pair is None or pair.slit == "upper"
+        if old.shape == "auto" and shape == "straight":
+            spec = ChannelSpec("straight", 90.0 if up else 270.0, 0.0)
+        elif old.shape == "auto" and shape == "curved":
+            spec = ChannelSpec("curved", 90.0 if up else 270.0, 0.0, 45.0 if up else 315.0, 5.0)
+        else:
+            spec = ChannelSpec(shape, old.angle, old.offset, old.entry, old.radius)
+        self._store_channel(name, spec)
+
+    def _channel_fields_changed(self) -> None:
+        name = self.ch_vars["hole"].get()
+        if not name or self.ch_vars["shape"].get() == "auto":
+            return
+        spec = self._channel_spec()
+        if spec != self._channel_specs().get(name):
+            self._store_channel(name, spec)
+
+    def _reset_channel(self) -> None:
+        self._store_channel(self.ch_vars["hole"].get(), ChannelSpec())
+
+    def _store_channel(self, name: str, spec: ChannelSpec, preview: bool = True) -> None:
+        if not name:
+            return
+        specs = self._channel_specs()
+        specs[name] = spec
+        self.vars["channels"].set(specs_to_text(specs))
+        self._show_channel_spec(spec)
+        self.draw()
+        if preview:
+            self._queue_channel_preview()
+
+    def _queue_channel_preview(self) -> None:
+        if self._channel_after is not None:
+            self.root.after_cancel(self._channel_after)
+        self._channel_after = self.root.after(CHANNEL_PREVIEW_MS, self._channel_preview)
+
+    def _channel_preview(self) -> None:
+        self._channel_after = None
+        if self.plan is not None:
+            self.preview(quiet=True)
+
+    def _shifted(self, points: "list[Point] | tuple[Point, ...]") -> list[Point]:
+        assert self.plan is not None
+        sx, sz = self.plan.generated.shift
+        return [(x + sx, z + sz) for x, z in points]
+
+    def _draw_channels(self) -> None:
+        """Each drawn channel at the root and tip faces, with its two handles on the root one."""
+        c, plan = self.canvas, self.plan
+        self.channel_handles = {}
+        if plan is None or not plan.generated.holes:
+            return
+        found = preview_channels(plan.generated.holes, self._channel_specs(), plan.generated.outers,
+                                 plan.request.settings.max_segment_length)
+        problems = []
+        for pair in plan.generated.holes:
+            selected = pair.name == self.ch_vars["hole"].get()
+            cx, cy = self._to_canvas(self._shifted([area_centre(list(pair.root_drawn))]))
+            c.create_text(cx, cy, text=pair.name, fill="#8e24aa" if selected else "#5f6368",
+                          font=("Segoe UI", 8, "bold" if selected else "normal"))
+            preview = found.get(pair.name)
+            if preview is None:
+                continue
+            if preview.problem:
+                problems.append(f"{pair.name}: {preview.problem}")
+            if preview.root is None or preview.tip is None:
+                continue
+            for path, colour in ((preview.tip, COLOURS["tip"]), (preview.root, COLOURS["root"])):
+                pts = self._shifted([path.entry, *path.points])
+                c.create_line(*self._to_canvas(pts), fill="#d93025" if preview.problem else colour,
+                              width=3 if selected else 2, dash=(6, 3))
+            ex, ey = self._to_canvas(self._shifted([preview.root.entry]))
+            ax, ay = self._to_canvas(self._shifted([preview.root.points[-1]]))
+            edge = "#d93025" if preview.problem else "#8e24aa"
+            c.create_oval(ex - 6, ey - 6, ex + 6, ey + 6, fill="white", outline=edge, width=2)
+            c.create_rectangle(ax - 6, ay - 6, ax + 6, ay + 6, fill="white", outline=edge, width=2)
+            self.channel_handles[(pair.name, "entry")] = (ex, ey)
+            self.channel_handles[(pair.name, "angle")] = (ax, ay)
+        if problems:
+            c.create_text(10, LEGEND_HEIGHT + 4, anchor="nw", fill="#d93025", text="\n".join(problems))
+
+    def _channel_press(self, event: "tk.Event[tk.Canvas]") -> None:
+        for key, (hx, hy) in self.channel_handles.items():
+            if (event.x - hx) ** 2 + (event.y - hy) ** 2 <= HANDLE_PIXELS ** 2:
+                self._channel_drag = key
+                if self.ch_vars["hole"].get() != key[0]:
+                    self.ch_vars["hole"].set(key[0])
+                    self._load_channel_fields()
+                return
+        p = self._to_world(event.x, event.y)
+        if p is None:
+            return
+        for pair in self._channel_pairs():
+            if any(inside(p, self._shifted(loop)) for loop in (pair.root_drawn, pair.tip_drawn)):
+                self.ch_vars["hole"].set(pair.name)
+                self._load_channel_fields()
+                return
+
+    def _channel_move(self, event: "tk.Event[tk.Canvas]") -> None:
+        """Drag a handle: the square turns the channel, the round one slides its entry."""
+        if self._channel_drag is None:
+            return
+        name, handle = self._channel_drag
+        pair = next((q for q in self._channel_pairs() if q.name == name), None)
+        p = self._to_world(event.x, event.y)
+        spec = self._channel_specs().get(name)
+        if pair is None or p is None or spec is None:
+            return
+        cx, cz = self._shifted([area_centre(list(pair.root_drawn))])[0]
+        towards = math.degrees(math.atan2(p[1] - cz, p[0] - cx)) % 360
+        if handle == "angle":
+            spec = replace(spec, angle=round(towards))
+        elif spec.shape == "straight":
+            d = (math.cos(math.radians(spec.angle)), math.sin(math.radians(spec.angle)))
+            spec = replace(spec, offset=round(d[0] * (p[1] - cz) - d[1] * (p[0] - cx), 1))  # + to the left
+        else:
+            spec = replace(spec, entry=round(towards))
+        self._store_channel(name, spec, preview=False)
+
+    def _channel_release(self) -> None:
+        if self._channel_drag is not None:
+            self._channel_drag = None
+            self._queue_channel_preview()
+
     # --- section view: zoom, pan, and moving the wire with the mouse -----------------------
 
     def fit_view(self) -> None:
@@ -1194,6 +1452,9 @@ class SlicerWindow:
         self.keys_down.discard(str(event.keysym).lower())
 
     def _mouse_moves_changed(self) -> None:
+        if self.mouse_moves.get() and self.edit_channels.get():
+            self.edit_channels.set(False)
+            self._edit_channels_changed()
         if self.mouse_moves.get():
             self.canvas.focus_set()
             self.status.set("Mouse moves the wire: click to send both towers there, hold X or Z for one tower, "
@@ -1206,6 +1467,9 @@ class SlicerWindow:
         return held or (0, 1)
 
     def _press(self, event: "tk.Event[tk.Canvas]") -> None:
+        if self.edit_channels.get():
+            self._channel_press(event)
+            return
         self._press_at = (event.x, event.y)
         self._press_towers = self.towers_for_keys()
         self._dragging = False
@@ -1229,6 +1493,9 @@ class SlicerWindow:
         return True
 
     def _drag(self, event: "tk.Event[tk.Canvas]") -> None:
+        if self.edit_channels.get():
+            self._channel_move(event)
+            return
         if self._press_at is None:
             return
         if not self._dragging:
@@ -1241,6 +1508,9 @@ class SlicerWindow:
             self.machine.follow(target)
 
     def _release(self, event: "tk.Event[tk.Canvas]") -> None:
+        if self.edit_channels.get():
+            self._channel_release()
+            return
         if self._press_at is None:
             return
         self._press_at = None

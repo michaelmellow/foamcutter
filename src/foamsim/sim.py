@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -11,8 +12,8 @@ import numpy as np
 from .compare import SectionResult, compare_section
 from .errors import GCodeError, InputError
 from .gcode import Motion, Program, parse_gcode
-from .geom import Arr, inside
-from .job import Job
+from .geom import Arr, inside, polyline_distance
+from .job import RAPID, Job
 from .profile import Profile
 from .target import SectionTarget, build_targets
 from .wire import sweep_hits_block, trace, wire_angle, wire_in_box
@@ -184,37 +185,44 @@ def simulate(
         result.error = "the program has fewer than 3 feed moves (lead-in, cut, exit)"
         return result
 
-    positions = np.array([feeds[0].start] + [m.end for m in feeds], dtype=np.float64)
-    durations = [m.duration or 0.0 for m in feeds]
-    lines = [m.line for m in feeds]
+    # The cut: every move from the lead-in to the exit. Rapids in between are
+    # channel exits (job file 10.4 and 13); they cut nothing new.
+    first = program.motions.index(feeds[0])
+    last = program.motions.index(feeds[-1])
+    cut = [m for m in program.motions[first : last + 1] if m.kind in ("feed", "rapid")]
+    positions = np.array([cut[0].start] + [m.end for m in cut], dtype=np.float64)
+    durations = [m.duration or 0.0 for m in cut]
+    lines = [m.line for m in cut]
     table = profile.kerf_tables[job.kerf_table]
 
-    traces: dict[str, Arr] = {}
+    traces = {name: trace(positions, span, target.y) for name, target in targets.items()}
+    exits = _channel_exits(cut, traces, targets, table.max_kerf)
     for name, target in targets.items():
-        traces[name] = trace(positions, span, target.y)
         result.sections[name] = compare_section(
-            target, traces[name], lines, durations, table, tolerance
+            target, traces[name], lines, durations, table, tolerance, exits
         )
     for y in planes:
         result.plane_traces[y] = trace(positions, span, y)
 
-    # Face distances per feed move.
+    # Face distances per move of the cut.
     dist = {n: np.hypot(*np.diff(t, axis=0).T) for n, t in traces.items()}
-    contour = range(1, len(feeds) - 1)
     for n in targets:
-        speeds = [dist[n][i] / durations[i] for i in contour if durations[i] > 0]
+        speeds = [dist[n][i] / durations[i] for i in range(1, len(cut) - 1)
+                  if durations[i] > 0 and not exits[i]]
         result.face_speeds[n] = (min(speeds), max(speeds)) if speeds else (0.0, 0.0)
-    d_root, d_tip = dist["root"], dist["tip"]
+    feed_index = [i for i, m in enumerate(cut) if m.kind == "feed"]
+    d_root, d_tip = dist["root"][feed_index], dist["tip"][feed_index]
+    feed_exits = [exits[i] for i in feed_index]
     result.lead_ratios = (_ratio(d_root[0], d_tip[0]), _ratio(d_root[-1], d_tip[-1]))
 
     result.checks = [
         _soft_limits(program.motions, profile),
         _wire_angle(program.motions, profile),
         _axis_rate(feeds, profile),
-        _speed_ratio(feeds, d_root, d_tip, profile),
-        _cut_speed(feeds, d_root, d_tip, job),
+        _speed_ratio(feeds, d_root, d_tip, profile, feed_exits),
+        _cut_speed(feeds, d_root, d_tip, job, feed_exits),
         _start_end(feeds, program.motions, profile, job, targets),
-        _rapids(program.motions, profile, job, targets),
+        _rapids(program.motions[:first] + program.motions[last + 1 :], profile, job, targets),
         _lead_in_exit(feeds, traces, targets, table.max_kerf),
     ]
 
@@ -296,12 +304,61 @@ def _axis_rate(feeds: list[Motion], profile: Profile) -> Check:
     return check
 
 
-def _speed_ratio(feeds: list[Motion], d_root: Arr, d_tip: Arr, profile: Profile) -> Check:
+def _channel_exits(
+    cut: list[Motion], traces: dict[str, Arr], targets: dict[str, SectionTarget], tol: float
+) -> list[bool]:
+    """Per move of the cut: True for a channel exit (job file 10.4). Rapids
+    between the lead-in and the exit are channel exits; a feed move is one if,
+    in every section, it runs along the same slit away from its feature."""
+    out = [m.kind == "rapid" for m in cut]
+    names = set.intersection(*(set(t.slits) for t in targets.values()))
+    for i in range(1, len(cut) - 1):
+        if out[i]:
+            continue
+        for name in names:
+            if all(_outward_on(traces[n][i], traces[n][i + 1], t.slits[name], tol)
+                   for n, t in targets.items()):
+                out[i] = True
+                break
+    return out
+
+
+def _outward_on(p0: Arr, p1: Arr, slit: Arr, tol: float) -> bool:
+    """True if segment p0-p1 lies within `tol` of `slit` and moves along it away
+    from its first point (the feature end)."""
+    pts = p0 + np.linspace(0.0, 1.0, 5)[:, None] * (p1 - p0)
+    if float(np.max(polyline_distance(pts, slit, closed=False))) > tol:
+        return False
+    return _along(p1, slit) > _along(p0, slit) + 1e-6
+
+
+def _along(p: Arr, slit: Arr) -> float:
+    """Arc length along `slit` of the point of it nearest to `p`."""
+    best, at, done = math.inf, 0.0, 0.0
+    for a, b in itertools.pairwise(slit):
+        d = b - a
+        length = float(np.hypot(*d))
+        f = 0.0 if length == 0 else min(1.0, max(0.0, float(np.dot(p - a, d)) / length**2))
+        gap = float(np.hypot(*(a + f * d - p)))
+        if gap < best:
+            best, at = gap, done + f * length
+        done += length
+    return at
+
+
+def _speed_ratio(
+    feeds: list[Motion], d_root: Arr, d_tip: Arr, profile: Profile, exits: list[bool]
+) -> Check:
     check = Check(
         "speed_ratio", True,
-        notes=["the lead-in and exit (first and last feed moves) are exempt (job file 10.5)"],
+        notes=[
+            ("the lead-in and exit (first and last feed moves) and channel exits are exempt "
+            "(job file 10.4, 10.5)")
+        ],
     )
     for i in range(1, len(feeds) - 1):
+        if exits[i]:
+            continue
         ratio = _ratio(float(d_root[i]), float(d_tip[i]))
         if ratio > profile.max_speed_ratio * (1 + 1e-9):
             check.messages.append(
@@ -312,20 +369,23 @@ def _speed_ratio(feeds: list[Motion], d_root: Arr, d_tip: Arr, profile: Profile)
     return check
 
 
-def _cut_speed(feeds: list[Motion], d_root: Arr, d_tip: Arr, job: Job) -> Check:
+def _cut_speed(feeds: list[Motion], d_root: Arr, d_tip: Arr, job: Job, exits: list[bool]) -> Check:
     check = Check(
         "cut_speed", True,
-        notes=["tolerance 0.001 mm + 0.1 % of the move length, for 4-decimal positions"],
+        notes=["tolerance 0.001 mm + 0.1 % of the move length, for 4-decimal positions",
+               "channel exits run at channel_exit when it is a number (job file 10.4)"],
     )
+    exit_speed = job.channel_exit if job.channel_exit and job.channel_exit != RAPID else job.cut_speed
     for i, m in enumerate(feeds):
         t = m.duration or 0.0
         fast = max(float(d_root[i]), float(d_tip[i]))
         if fast == 0:
             continue
-        if abs(fast - job.cut_speed * t) > 1e-3 + 1e-3 * fast:
+        speed, what = (exit_speed, "channel_exit") if exits[i] else (job.cut_speed, "cut_speed")
+        if abs(fast - speed * t) > 1e-3 + 1e-3 * fast:
             check.messages.append(
                 f"line {m.line}: faster foam face moves at {fast / t:.2f} mm/min, "
-                f"job cut_speed is {job.cut_speed:g}"
+                f"job {what} is {speed:g}"
             )
     check.passed = not check.messages
     return check

@@ -25,11 +25,13 @@ from the target alone:
   is;
 - the edge goes to the candidate it lies closest to (largest distance of five
   points along the moved edge, or along the edge itself for open cuts and
-  slits; for a slit also the other way round, since one move cuts a whole
-  slit).
+  slits; for a slit also the other way round, segment by segment, since one
+  move cuts a whole slit segment; a channel has one segment per move).
 
 The first and last feed moves are the lead-in and exit (job file section 13)
-and are not part of any element.
+and are not part of any element. Channel exits (job file 10.4: rapids between
+the lead-in and the exit, and feed moves the caller marks as exits) run back
+along a slit already cut: they are only checked to lie on a slit.
 
 Deviation of an element = symmetric Hausdorff distance between the simulated
 surface and the target, computed on points spaced at most `step` apart on
@@ -139,17 +141,28 @@ def _assign(edge: Edge, candidates: list[_Candidate]) -> tuple[_Candidate, float
             # Material inside (outer): the side further inside. Outside (hole):
             # the side further outside.
             side = 1.0 if c.material * (sd[1] - sd[0]) > 0 else -1.0
-        dist = float(np.max(polyline_distance(pts + side * h * n, c.shape, c.closed)))
-        if not c.compared:
-            # A slit is cut by one move that spans all of it: require that both
-            # ways, so that a feature edge lying on the slit line is not taken
-            # for the slit.
-            ends = c.shape[0] + _FRACTIONS[:, None] * (c.shape[-1] - c.shape[0])
-            back = polyline_distance(ends, np.vstack([edge.p0, edge.p1]), closed=False)
-            dist = max(dist, float(np.max(back)))
+        if c.compared:
+            dist = float(np.max(polyline_distance(pts + side * h * n, c.shape, c.closed)))
+        else:
+            dist = _slit_distance(edge, pts, c.shape)
         if best is None or dist < best[2]:
             best = (c, side, dist)
     assert best is not None
+    return best
+
+
+def _slit_distance(edge: Edge, pts: Arr, slit: Arr) -> float:
+    """Distance from an edge to the nearest segment of a slit, both ways: one
+    move cuts a whole slit segment, so a feature edge lying on the slit line is
+    not taken for the slit."""
+    seg = np.vstack([edge.p0, edge.p1])
+    best = math.inf
+    for j in range(len(slit) - 1):
+        piece = slit[j : j + 2]
+        one = float(np.max(polyline_distance(pts, piece, closed=False)))
+        ends = piece[0] + _FRACTIONS[:, None] * (piece[1] - piece[0])
+        back = float(np.max(polyline_distance(ends, seg, closed=False)))
+        best = min(best, max(one, back))
     return best
 
 
@@ -282,19 +295,31 @@ def compare_section(
     durations: list[float],
     table: KerfTable,
     tolerance: float,
+    exits: list[bool] | None = None,
 ) -> SectionResult:
-    """Compare the trace of all feed moves in the plane of `target` with it.
+    """Compare the trace of all moves of the cut in the plane of `target` with it.
 
-    `trace[i]` and `trace[i + 1]` are the wire's start and end points of feed
-    move i in this plane; `lines` and `durations` (minutes) are per move."""
+    `trace[i]` and `trace[i + 1]` are the wire's start and end points of move
+    i in this plane; `lines` and `durations` (minutes) are per move. Moves
+    marked in `exits` (channel exits, rapids among them) only have to lie on a
+    slit."""
     result = SectionResult(target.name, target.y, trace)
     candidates = _candidates(target)
+    slits = [c for c in candidates if not c.compared]
     per_key: dict[str, list[Edge]] = {c.key: [] for c in candidates}
 
     for i in range(1, len(durations) - 1):
         p0, p1 = trace[i], trace[i + 1]
         length = float(np.hypot(*(p1 - p0)))
         if length < 1e-9:
+            continue
+        if exits is not None and exits[i]:
+            exit_edge = Edge(i, lines[i], p0, p1, 0.0)
+            dist = min((_assign(exit_edge, [c])[2] for c in slits), default=math.inf)
+            if dist > 1.5 * table.max_kerf:
+                result.problems.append(
+                    f"line {lines[i]}: channel exit {dist:.3f} mm away from the nearest slit"
+                )
             continue
         try:
             kerf = kerf_lookup(table, length / durations[i])

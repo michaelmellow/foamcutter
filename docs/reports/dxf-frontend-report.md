@@ -545,3 +545,98 @@ Verified by tests:
 
 NOT verified: anything on the machine, in particular how long "done" takes
 after the last `ok` on the real board (status every 0.2 s).
+
+## 10. Drawn hole channels and a fast channel exit (owner's request)
+
+The owner asked to set the entrance to each inner contour graphically
+(direction, offset from the hole centre, and shape), and to leave the channel
+quickly once the hole is cut, so the hot wire melts no more than needed.
+
+**This changes the approved job format and the CAM core.** The owner chose
+to extend the format rather than post-process G-code, so the job file still
+describes the real cut. All of it is optional: a job without the new fields
+cuts exactly as before (a test compares the G-code).
+
+- `docs/formats/job-file.md`:
+  - §3 adds `channel_exit`: `"rapid"`, a speed, or absent (cut speed, as
+    before).
+  - §8 adds an optional `channel` per feature, a polyline from the feature's
+    first point outward. Only its last segment crosses the outer contour;
+    the slit point is where it does. It must not cross itself, another
+    feature, or its own feature. Channel points are not kerf compensated.
+  - §10.2, §10.4, §11, §11.1 and §13 follow from that. Channel points are
+    fixed pairs. The way back out is the "channel exit", as `G0` or at its
+    own speed. Channel exits are exempt from the speed-ratio check. A `G0`
+    may now appear between the lead-in and the exit.
+- `foamcam`: reads both fields, finds the slit point on the channel and
+  checks its rules (`sections.channel_problem`), adds the channel points to
+  the path, and writes the exit as `G0` or as timed feed moves. The report
+  says how the channels are left. The rapid check of §10.6 still covers only
+  the start and end rapids.
+- `foamsim`:
+  - reads both fields;
+  - builds each slit as a polyline;
+  - rejects a channel that crosses another feature;
+  - keeps rapids between the lead-in and the exit in the trace and requires
+    them to lie on a slit;
+  - recognises feed moves that run back out along a slit, checks them at
+    `channel_exit` and exempts them from the speed ratio.
+
+**Front end.** A hole's channel is set by a `ChannelSpec`, the same for root
+and tip, each about its own hole centre:
+- **auto**: as before, straight up or down (the "Hole channel from" setting).
+- **straight**: an angle, plus an offset of the line from the hole centre.
+  The hole starts where that line leaves it.
+- **curved**: an entry angle around the hole, a bend radius and the final
+  angle. The channel leaves along the hole's edge (tangent), bends with that
+  radius and runs straight out. The hole is cut clockwise when turning right
+  is the shorter way, so the wire never doubles back at the entry. The tip
+  uses the root's bend step count, so the two lists match point for point.
+
+**Editing.** Tick "Edit channels" in the Machine tab's section view (it
+turns off "Mouse moves the wire"). A row shows the hole, its shape and the
+numbers. Click a hole to pick it. Drag the round handle to slide the entry
+(offset or entry angle), or the square one to turn the channel. Root and
+tip channels are drawn live, red with the reason when the CAM would refuse
+them. On release the job is rebuilt. If it fails, the last good cut stays
+on screen and the status line says why. Specs are kept in the settings and
+in projects (the `channels` value, JSON). The form gets "Channel exit"
+(`rapid`, default; `cut`; or mm/min), and the CLI `--channel-exit`.
+
+Verified by tests:
+- `tests/cam/test_channels.py` (10): a one-point channel straight up gives
+  the same G-code as the plain slit; an angled channel meets the contour on
+  its line; curved channel points are passed in and back out; rapid exits
+  are G0 and the cut resumes after them; a numeric exit speed times the move;
+  bad channels and mismatched lists are refused.
+- `tests/sim/test_channels.py` (9): CAM programs with straight, angled,
+  curved, rapid-exit, numeric-exit and tapered channels all pass the
+  simulator; a rapid exit moved 3 mm off the slit is caught; a wrong exit
+  speed fails `cut_speed`; a channel through another hole is refused.
+- `tests/dxf/test_channels.py` (8): straight entry geometry (offset to the
+  left, far side of the circle); a curved start tangent to the circle,
+  ending at the set angle and cut clockwise; errors name the hole; previews
+  report problems without the CAM; the `channel_exit` field; specs, form and
+  CLI. A window test drags the square handle to 135 degrees, rebuilds the
+  job with the channel, and checks an impossible channel keeps the last good
+  cut.
+
+Found on the way, NOT fixed (outside this change):
+- `check.py sim` already failed before this change, with the same 19 tests.
+  The simulator rejects `table_z` in the example profiles (added to the
+  machine profile by the Brief 3 table_z change). It also rejects the CAM's
+  opening lift (a `G0` with only the two vertical axes). The new simulator
+  tests strip both to test channels.
+- `check.py step` exits 5: `tests/step` has no tests.
+
+NOT verified:
+- anything on the machine;
+- how far the hot wire still melts during a rapid exit on the real foam
+  (it should be little: the slit is already cut);
+- whether a bend radius smaller than about the kerf leaves a clean entry.
+
+Open questions for the project director:
+- approval of the §3, §8, §10.4, §11 and §13 changes to `job-file.md`;
+- whether the rapid exit should also be the default for jobs written by
+  hand (the CAM's default is still the cut speed, so old jobs are unchanged);
+- updating the simulator for `table_z` and the opening lift.

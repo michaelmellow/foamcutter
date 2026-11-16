@@ -8,13 +8,14 @@ from . import __version__
 from . import geometry as g
 from .errors import CamError, ValidationError
 from .geometry import Point
-from .job import Job
+from .job import RAPID, Job
 from .profile import Profile
 from .sections import Outline, build_outline, check_in_block
 
 Axes = tuple[float, float, float, float]
 
-# A path node is a reference into the geometry: ("outer", i) or ("feature", name, i).
+# A path node is a reference into the geometry: ("outer", i), ("feature", name, i)
+# or ("channel", name, i) (§8 channel point i, not kerf compensated).
 Ref = tuple[str, int] | tuple[str, str, int]
 
 # §10.7: the kerf lookup is repeated until no half kerf changes by more than
@@ -31,7 +32,7 @@ MERGE_GAP = 0.001
 
 @dataclass
 class Move:
-    kind: str  # "rapid", "lead_in", "cut", "exit"
+    kind: str  # "rapid", "lead_in", "cut", "channel_exit" (§10.4, at a numeric channel_exit), "exit"
     axes: Axes
     duration: float = 0.0  # minutes, feed moves only
     root_length: float = 0.0  # mm moved at the root foam face
@@ -133,6 +134,10 @@ class Cam:
             for i, (p, q) in enumerate(zip(placed_r, placed_t)):
                 comp_r[("feature", name, i)] = p
                 comp_t[("feature", name, i)] = q
+            # §10.4: channel points are not compensated; the last lies beyond the slit point.
+            for i in range(len(f_r.channel) - 1):
+                comp_r[("channel", name, i)] = self.root.place(f_r.channel[i])
+                comp_t[("channel", name, i)] = self.tip.place(f_t.channel[i])
         return comp_r, comp_t, tags
 
     def outer_contour(self) -> tuple[list[Point], list[Point], list[str | None]]:
@@ -250,9 +255,11 @@ class Cam:
             points = self.kerf.points
             return points[0][1] if speed < points[0][0] else points[-1][1]
 
-    def path(self, n_outer: int, tags: list[str | None]) -> list[Ref]:
-        """§10.4: the order of moves through the path nodes."""
+    def path(self, n_outer: int, tags: list[str | None]) -> tuple[list[Ref], set[int]]:
+        """§10.4: the order of moves through the path nodes, and the positions in
+        it of the nodes reached by a channel-exit move."""
         refs: list[Ref] = []
+        exits: set[int] = set()
         for i in range(n_outer + 1):
             refs.append(("outer", i % n_outer))
             name = tags[i] if i < n_outer else None
@@ -264,9 +271,13 @@ class Cam:
                 order = list(range(k)) + [0]
             else:
                 order = list(range(k)) + list(range(k - 2, -1, -1))
+            channel: list[Ref] = [("channel", name, j) for j in range(len(feature.channel) - 1)]
+            refs += channel[::-1]
             refs += [("feature", name, v) for v in order]
-            refs.append(("outer", i % n_outer))
-        return refs
+            for ref in [*channel, ("outer", i % n_outer)]:
+                exits.add(len(refs))
+                refs.append(ref)
+        return refs, exits
 
     def offset_face(self, outline: Outline, placed: list[Point], half: list[float], outward: bool, where: str) -> list[Point]:
         """Offset one face's polygon (§10.7), with the guard against spikes."""
@@ -292,7 +303,7 @@ class Cam:
     def run(self) -> CamResult:
         job = self.job
         comp_r, comp_t, tags = self.compensate()
-        refs = self.path(len(tags) - 1, tags)
+        refs, exits = self.path(len(tags) - 1, tags)
 
         x_entry = job.block.x + job.block.length + job.lead_in
         start = refs[0]
@@ -317,7 +328,14 @@ class Cam:
             if max(dr, dt) < 1e-6:
                 continue
             kind = "lead_in" if k == 1 else "exit" if k == last else "cut"
-            moves.append(Move(kind, self.project(r, t), max(dr, dt) / job.cut_speed, dr, dt))
+            speed = job.cut_speed
+            if k - 1 in exits and job.channel_exit:  # points[k] is refs[k - 1]
+                if job.channel_exit == RAPID:
+                    moves.append(Move("rapid", self.project(r, t)))
+                    prev_r, prev_t = r, t
+                    continue
+                kind, speed = "channel_exit", job.channel_exit
+            moves.append(Move(kind, self.project(r, t), max(dr, dt) / speed, dr, dt))
             prev_r, prev_t = r, t
         # Leave the same way: straight up from the entry point, then across.
         moves += [Move("rapid", above_entry)] if crossing else []

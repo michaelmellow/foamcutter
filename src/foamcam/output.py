@@ -60,6 +60,15 @@ def report(
         for m in feed:
             if m.kind == kind:
                 lines.append(f"{label} speed ratio: {speed_ratio(m):.3f} (exempt from the limit: waste foam)")
+    if any(f.channel for f in job.root.features) or job.channel_exit:
+        from .job import RAPID
+
+        how = (
+            "rapid (G0)" if job.channel_exit == RAPID
+            else f"{job.channel_exit:g} mm/min" if job.channel_exit else f"cut speed {job.cut_speed:g} mm/min"
+        )
+        lines.append(f"Channel exits: {how}; channels (not kerf compensated): "
+                     + (", ".join(f.name for f in job.root.features if f.channel) or "none, straight slits only"))
     for face in ("root", "tip"):
         used = kerf_used[face]
         if used:

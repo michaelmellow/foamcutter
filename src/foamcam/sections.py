@@ -1,5 +1,6 @@
 """Target geometry of a section (job-file.md §6) and its slits (§8)."""
 
+import itertools
 import math
 from dataclasses import dataclass
 
@@ -113,13 +114,25 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
     if not ok:
         return None
 
-    # §8 slits: from the first feature point along +v or -v to the outer contour.
+    # §8 slits: from the first feature point along +v or -v (or along the
+    # channel) to the outer contour.
     n = len(contour)
     hits: dict[int, list[tuple[float, str]]] = {}
     for i, f in enumerate(section.features):
         path = f"{label}.features[{i}]"
-        direction = (0.0, 1.0) if f.slit == "upper" else (0.0, -1.0)
-        hit = g.ray_hit(f.points[0], direction, contour)
+        if f.channel:
+            why = channel_problem(f, contour, outer_edges, section.features, feature_edges)
+            if why:
+                problems.append(f'{path}.channel: the channel of "{f.name}" {why}')
+                ok = False
+                continue
+            start = f.channel[-2] if len(f.channel) > 1 else f.points[0]
+            end = f.channel[-1]
+            length = g.dist(start, end)
+            hit = g.ray_hit(start, ((end[0] - start[0]) / length, (end[1] - start[1]) / length), contour)
+        else:
+            direction = (0.0, 1.0) if f.slit == "upper" else (0.0, -1.0)
+            hit = g.ray_hit(f.points[0], direction, contour)
         if hit is None:
             problems.append(f'{path}: the slit of "{f.name}" does not reach the outer contour')
             ok = False
@@ -156,6 +169,42 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
                 new_contour.append((a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1])))
                 slit_index[name] = len(new_contour) - 1
     return Outline(section, tuple(new_contour), new_le, slit_index, features)
+
+
+def channel_problem(
+    f: Feature,
+    contour: list[Point],
+    outer_edges: list[tuple[Point, Point]],
+    features: tuple[Feature, ...],
+    feature_edges: dict[str, list[tuple[Point, Point]]],
+) -> str:
+    """§8 Channels: what is wrong with the channel of `f`, or "" if nothing."""
+    pts = [f.points[0], *f.channel]
+    if any(g.dist(a, b) < 1e-9 for a, b in itertools.pairwise(pts)):
+        return "has two equal points in a row"
+    if not all(g.inside(p, contour) for p in f.channel[:-1]):
+        return "leaves the outer contour before its last point"
+    if g.inside(f.channel[-1], contour):
+        return "must end outside the outer contour (its last point is inside)"
+    path_edges = g.edges(pts, closed=False)
+    if g.any_crossing(path_edges[:-1], outer_edges):
+        return "crosses the outer contour before its last segment"
+    for a in range(len(path_edges)):
+        for b in range(a + 2, len(path_edges)):
+            if g.segments_cross(*path_edges[a], *path_edges[b]):
+                return "crosses itself"
+    if g.any_crossing(path_edges, feature_edges[f.name]) or (
+        f.kind == "hole" and any(g.inside(p, list(f.points)) for p in f.channel)
+    ):
+        return "runs into its own feature"
+    for other in features:
+        if other.name == f.name:
+            continue
+        if g.any_crossing(path_edges, feature_edges[other.name]) or (
+            other.kind == "hole" and any(g.inside(p, list(other.points)) for p in f.channel)
+        ):
+            return f'crosses feature "{other.name}"'
+    return ""
 
 
 def check_in_block(outline: Outline, block: Block, table_z: float, problems: list[str]) -> None:

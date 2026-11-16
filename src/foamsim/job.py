@@ -6,6 +6,7 @@ checked in `target.build_targets`.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ TOP_KEYS = (
     "mirror", "block", "root", "tip",
 )
 SECTION_KEYS = ("shape", "chord", "twist", "twist_axis", "position")
+RAPID = math.inf  # Job.channel_exit for channel_exit: "rapid" (job file section 3)
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,7 @@ class Feature:
     kind: str  # "hole" or "open"
     slit: str  # "upper" or "lower"
     points: tuple[tuple[float, float], ...]  # mm, untwisted section frame
+    channel: tuple[tuple[float, float], ...] = ()  # section 8 channel; () = straight slit
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,7 @@ class Job:
     block: Block
     root: Section
     tip: Section
+    channel_exit: float = 0.0  # 0: at cut_speed, RAPID: G0, else mm/min (job file 10.4)
 
     @property
     def sections(self) -> tuple[Section, Section]:
@@ -86,7 +90,7 @@ def load_job(path: Path | str) -> Job:
 def parse_job(data: Any, base_dir: Path) -> Job:
     """Validate `data` (the loaded YAML). `.dat` paths are relative to `base_dir`."""
     c = Checker()
-    top = c.mapping(data, "", TOP_KEYS)
+    top = c.mapping(data, "", TOP_KEYS, ("channel_exit",))
     if top is None:
         c.raise_if_any()
         raise AssertionError  # unreachable
@@ -104,6 +108,15 @@ def parse_job(data: Any, base_dir: Path) -> Job:
     min_te = c.number(top, "min_te_thickness", "", lambda v: v >= 0, ">= 0")
     lead_in = c.number(top, "lead_in", "", lambda v: v > 0, "> 0")
     mirror = c.boolean(top, "mirror", "")
+    channel_exit = 0.0
+    if "channel_exit" in top:
+        raw_exit = top["channel_exit"]
+        if raw_exit == "rapid":
+            channel_exit = RAPID
+        elif isinstance(raw_exit, bool) or not isinstance(raw_exit, (int, float)) or raw_exit <= 0:
+            c.error("channel_exit", 'must be "rapid" or a number > 0')
+        else:
+            channel_exit = float(raw_exit)
 
     safe: list[float] = []
     raw_safe = c.items(top, "safe_position", "")
@@ -151,6 +164,7 @@ def parse_job(data: Any, base_dir: Path) -> Job:
         block=block,
         root=root,
         tip=tip,
+        channel_exit=channel_exit,
     )
 
 
@@ -192,7 +206,7 @@ def _parse_section(c: Checker, data: Any, label: str, base_dir: Path) -> Section
     raw_features = c.items(m, "features", label)
     for i, f in enumerate(raw_features or []):
         p = f"{label}.features[{i}]"
-        fm = c.mapping(f, p, ("name", "kind", "slit", "points"))
+        fm = c.mapping(f, p, ("name", "kind", "slit", "points"), ("channel",))
         fname = c.text(fm, "name", p)
         kind = c.text(fm, "kind", p, choices=("hole", "open"))
         slit = c.text(fm, "slit", p, choices=("upper", "lower"))
@@ -203,8 +217,15 @@ def _parse_section(c: Checker, data: Any, label: str, base_dir: Path) -> Section
             need = 3 if kind == "hole" else 2
             if len(fpts) < need:
                 c.error(f"{p}.points", f"a {kind} needs at least {need} points")
-        if None not in (fname, kind, slit, fpts):
-            features.append(Feature(str(fname), str(kind), str(slit), tuple(fpts or ())))
+        channel: list[tuple[float, float]] | None = []
+        if fm is not None and "channel" in fm:
+            channel = _pairs(c, fm["channel"], f"{p}.channel")
+            if channel is not None and not channel:
+                c.error(f"{p}.channel", "must hold at least 1 point")
+        if None not in (fname, kind, slit, fpts, channel):
+            features.append(
+                Feature(str(fname), str(kind), str(slit), tuple(fpts or ()), tuple(channel or ()))
+            )
 
     if len(c.errors) > errors_before:
         return None
@@ -250,6 +271,8 @@ def _match_features(c: Checker, root: Section, tip: Section) -> None:
             c.error(f"{p}.slit", f'differs from the tip feature "{f.name}"')
         if len(f.points) != len(g.points):
             c.error(f"{p}.points", f'count differs from the tip feature "{f.name}"')
+        if len(f.channel) != len(g.channel):
+            c.error(f"{p}.channel", f'point count differs from the tip feature "{f.name}"')
     names = {f.name for f in root.features}
     for i, g in enumerate(tip.features):
         if g.name not in names:

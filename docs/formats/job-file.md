@@ -67,6 +67,7 @@ tip: { ... }
 | `lead_in` | number, mm | yes | Clearance along `x` between the block's front face and the entry point, where the wire starts and ends its cut (§10.5). > 0. |
 | `safe_position` | list of 4 numbers, mm | yes | Axis 1 to axis 4 G54 positions where the program starts and ends (§10.6). |
 | `mirror` | boolean | yes | `true` cuts the mirror-image panel (§12). |
+| `channel_exit` | `"rapid"` or number, mm/min | no | How the wire leaves each slit once its feature is cut (§10.4). `"rapid"`: rapid moves (`G0`). A number > 0: feed moves at that speed at the faster foam face (§11). Absent: feed moves at `cut_speed`, like every other feed move. |
 | `block` | mapping | yes | The foam block (§5). |
 | `root` | section | yes | First section (§4). |
 | `tip` | section | yes | Second section (§4). |
@@ -292,6 +293,7 @@ matched by name.
 | `kind` | text | yes | `"hole"` or `"open"`. Same in both sections. |
 | `slit` | text | yes | `"upper"` or `"lower"`: the side of the outer contour the wire comes from. Same in both sections. |
 | `points` | list of `[u, v]` pairs, mm | yes | Feature vertices in the **untwisted section frame**: mm, origin at the leading edge after §6.1 to §6.3, `u` toward the trailing edge, `v` toward the upper side. Root and tip lists must have the same number of points. |
+| `channel` | list of `[u, v]` pairs, mm | no | The path of the slit when it is not straight along `±v` (see **Channels** below). Same frame as `points`. At least 1 point. Root and tip lists must have the same number of points, and either both sections give a channel or neither does. |
 
 - `kind: "hole"` is a closed polygon: the vertices in order, closed by an edge
   from the last back to the first. Do not repeat the first point at the end.
@@ -313,6 +315,19 @@ for `"upper"`, between `i_le` and `n − 1` for `"lower"`. Otherwise the job is
 invalid. The slit is part of the cut but **not** part of the target geometry.
 It leaves a thin cut in the finished part, and the simulator should exclude it
 when comparing.
+
+**Channels.** A feature with `channel` replaces the straight slit with a
+polyline: from the feature's first point through the `channel` points in
+order. Every channel point except the last must lie strictly inside the target
+outer contour (after §6.2 and §6.3), and the last strictly outside it, so only
+the last segment crosses the outer contour. The slit point is the first point
+where that segment meets the outer contour, and the slit ends there; the part
+of the segment beyond it is not cut. The slit point must lie on the side named
+by `slit`, as above. The channel must not cross itself, must not cross or touch
+any other feature, and must not cross its own feature's edges except at its
+first point. Channel points go through §6.4 and §6.5 like feature points. Like
+a straight slit, a channel is cut but is not part of the target geometry. A
+straight slit in any direction is a channel of one point.
 
 **Order.** Along the cutting direction (§10.1) the slit points of root and tip
 must occur in the same order of feature names. If not, the job is invalid.
@@ -344,8 +359,8 @@ The start point is called `S`.
 ### 10.2 Fixed pairs
 
 These points are matched one to one between root and tip: `S`, the leading
-edge, the far trailing-edge point, the slit points, and every vertex of every
-feature. The slit points are inserted into the outer contour of §6.3 as extra
+edge, the far trailing-edge point, the slit points, every vertex of every
+feature, and every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
 vertices. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
 the placed contours of §6.5, in each section plane. Twist and placement are a
 rotation and a translation, so lengths and angles are the same in both frames.
@@ -395,17 +410,26 @@ Feature vertices are not resampled.
 ### 10.4 Order of moves
 
 1. From `S` along the outer contour in the traversal direction.
-2. On reaching a slit point: one move along the slit to the feature's first
-   point, then
+2. On reaching a slit point: along the slit to the feature's first point (one
+   move for a straight slit; for a channel, one move per channel segment,
+   through the channel points in reverse order), then
    - hole: around the feature through all vertices and back to its first point;
    - open: along the vertices to the last one, then back through them in reverse
      to the first;
-   then one move back along the slit to the slit point, and on along the
-   contour.
+   then back along the slit the same way to the slit point (the **channel
+   exit**), and on along the contour.
 3. Back at `S` after the trailing-edge face.
 
 Each move goes from one paired point to the next, at root and tip at the same
-time.
+time. Channel points are not kerf compensated (§10.7): the slit is not part of
+the target, and the wire leaves it along the same line it came in.
+
+The channel exit follows the slit just cut, so it removes no further material
+except what the hot wire melts while passing. With `channel_exit: "rapid"` its
+moves are rapid moves (`G0`); with a number they are feed moves at that speed
+(§11); without the field they are ordinary feed moves at `cut_speed`. A rapid
+channel exit lies inside the block by design, so the rapid check of §10.6 does
+not apply to it.
 
 ### 10.5 Lead-in and exit
 
@@ -518,7 +542,9 @@ compensated wire points at the two foam faces. The duration is
 T = max(d_r, d_t) / cut_speed        (minutes)
 ```
 
-so the faster face moves at exactly `cut_speed`. Moves with `d_r = d_t = 0`
+so the faster face moves at exactly `cut_speed`. Channel-exit feed moves
+(§10.4) with a numeric `channel_exit` use that speed in place of `cut_speed`.
+Moves with `d_r = d_t = 0`
 are dropped. Total cut time = sum of `T` = (path length at the faster face) /
 `cut_speed`, where that path length is the sum of `max(d_r, d_t)` over all
 feed moves.
@@ -537,8 +563,9 @@ any of these fails:
   names the axis number, its letter, the limit and by how much it is exceeded.
 - **Wire angle.** At every motion line's end position the wire angle (machine
   profile §6) is at most `max_wire_angle`.
-- **Speed ratio.** For every feed move except the lead-in and the exit
-  (§10.5), the speed ratio at the foam faces is at most `max_speed_ratio`.
+- **Speed ratio.** For every feed move except the lead-in, the exit (§10.5)
+  and the channel exits (§10.4), the speed ratio at the foam faces is at most
+  `max_speed_ratio`.
 - **Axis rate.** For every feed move, each axis's speed `|Δa| / T` is at most
   that axis's `max_rate`.
 - **Kerf table range.** Only the settled lookup of §10.7 step 6 counts.
@@ -572,7 +599,9 @@ simulator) may reject anything else.
   profile (§3). Written once, before any motion.
 - `G90`: absolute positions. Written once, before any motion.
 - `G93`: inverse-time feed. Written once, before the first `G1`.
-- `G0 <a1> <a2> <a3> <a4>`: rapid move. All four axis words.
+- `G0 <a1> <a2> <a3> <a4>`: rapid move. All four axis words. Between the
+  lead-in and the exit a `G0` is a channel exit (§10.4): it runs back along a
+  slit that has just been cut.
 - `G1 <a1> <a2> <a3> <a4> F<f>`: feed move. All four axis words and `F` on
   every line.
 - `G94`: units-per-minute feed. Written once, after the last motion, so the
@@ -605,7 +634,8 @@ G93
 G0 <safe_position>
 G0 <entry points E, projected>
 G1 ... F...      (lead-in, E to S)
-G1 ... F...      (contour, slits and features, §10.4)
+G1 ... F...      (contour, slits and features, §10.4;
+                  G0 for each channel exit with channel_exit: "rapid")
 G1 ... F...      (exit, S to E)
 G0 <safe_position>
 G94
