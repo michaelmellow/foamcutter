@@ -1,0 +1,51 @@
+# Sample machine profile. Format: docs/formats/machine-profile.md
+#
+# SAMPLE VALUES ONLY. None of these numbers were measured on the real machine.
+# Replace every value after commissioning (firmware/ procedure) and after
+# cutting and measuring the kerf test.
+#
+# All positions are G54 work coordinates. Each axis reads 0 at its homed
+# position (docs/formats/machine-profile.md section 3).
+
+format: "foamcutter-machine-profile"
+version: 1
+name: "sample machine (not measured)"
+
+axes:
+  - letter: "X"        # axis 1: left tower, horizontal (+ = toward the front)
+    min: 0.0
+    max: 600.0
+    max_rate: 1200.0
+    lead: 8.0
+  - letter: "Y"        # axis 2: left tower, vertical (+ = up)
+    min: 0.0
+    max: 350.0
+    max_rate: 1200.0
+    lead: 8.0
+  - letter: "Z"        # axis 3: right tower, horizontal (+ = toward the front)
+    min: 0.0
+    max: 600.0
+    max_rate: 1200.0
+    lead: 8.0
+  - letter: "A"        # axis 4: right tower, vertical (+ = up)
+    min: 0.0
+    max: 350.0
+    max_rate: 1200.0
+    lead: 8.0
+
+wire_span: 900.0       # mm between the two carriage planes (wire points)
+table_z: 0.0           # G54 z of the table top (machine-profile.md section 3.4)
+
+limits:
+  max_wire_angle: 30.0   # degrees from the y axis
+  max_speed_ratio: 3.0   # faster foam face speed / slower foam face speed
+
+kerf_tables:
+  - name: "eps-20-sample"
+    description: "SAMPLE: EPS 20 kg/m3, invented values, not measured"
+    points:
+      - { speed: 30.0,  kerf: 2.00 }
+      - { speed: 60.0,  kerf: 1.60 }
+      - { speed: 120.0, kerf: 1.10 }
+      - { speed: 240.0, kerf: 0.80 }
+      - { speed: 480.0, kerf: 0.60 }
