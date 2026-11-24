@@ -2,7 +2,7 @@
 
 import itertools
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 
 from . import geometry as g
 from .geometry import Point
@@ -14,6 +14,8 @@ class Outline:
     """A section after §6.1 to §6.3, in the untwisted section frame (mm).
 
     `contour` runs in Selig order with the slit points of §8 inserted.
+    `branch_index` maps a feature whose channel ends in another hole to that
+    parent's name and the index of the slit point inserted into its points.
     """
 
     section: Section
@@ -21,6 +23,7 @@ class Outline:
     le_index: int
     slit_index: dict[str, int]
     features: dict[str, Feature]
+    branch_index: dict[str, tuple[str, int]] = field(default_factory=dict)
 
     def place(self, p: Point) -> Point:
         """Twist (§6.4) and place (§6.5): section frame (u, v) -> work frame (x, z)."""
@@ -118,6 +121,8 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
     # channel) to the outer contour.
     n = len(contour)
     hits: dict[int, list[tuple[float, str]]] = {}
+    branch_hits: dict[str, list[tuple[int, float, str]]] = {}  # parent -> (edge, fraction, child)
+    parents: dict[str, str] = {}
     for i, f in enumerate(section.features):
         path = f"{label}.features[{i}]"
         if f.channel:
@@ -129,7 +134,18 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
             start = f.channel[-2] if len(f.channel) > 1 else f.points[0]
             end = f.channel[-1]
             length = g.dist(start, end)
-            hit = g.ray_hit(start, ((end[0] - start[0]) / length, (end[1] - start[1]) / length), contour)
+            direction = ((end[0] - start[0]) / length, (end[1] - start[1]) / length)
+            parent = channel_parent(f, section.features)
+            if parent is not None:
+                branch = g.ray_hit(start, direction, list(parent.points))
+                if branch is None:  # cannot happen: the last point lies inside the parent
+                    problems.append(f'{path}.channel: the channel of "{f.name}" does not reach "{parent.name}"')
+                    ok = False
+                    continue
+                parents[f.name] = parent.name
+                branch_hits.setdefault(parent.name, []).append((branch[1], branch[2], f.name))
+                continue
+            hit = g.ray_hit(start, direction, contour)
         else:
             direction = (0.0, 1.0) if f.slit == "upper" else (0.0, -1.0)
             hit = g.ray_hit(f.points[0], direction, contour)
@@ -145,8 +161,30 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
             ok = False
             continue
         hits.setdefault(edge, []).append((s, f.name))
+    for name in parents:  # §8: following the parents must reach the outer contour
+        seen = [name]
+        while seen[-1] in parents:
+            nxt = parents[seen[-1]]
+            if nxt in seen:
+                loop = seen[seen.index(nxt):]
+                problems.append(
+                    f"{label}.features: the channels of " + ", ".join(f'"{x}"' for x in loop)
+                    + " only lead into each other and never reach the outer contour"
+                )
+                ok = False
+                break
+            seen.append(nxt)
+        if not ok:
+            break
     if not ok:
         return None
+
+    branch_index: dict[str, tuple[str, int]] = {}
+    for parent_name, found in branch_hits.items():
+        parent = features[parent_name]
+        points, index = _insert_points(list(parent.points), found)
+        features[parent_name] = replace(parent, points=tuple(points))
+        branch_index.update({child: (parent_name, k) for child, k in index.items()})
 
     new_contour: list[Point] = []
     slit_index: dict[str, int] = {}
@@ -168,7 +206,39 @@ def build_outline(section: Section, min_te_thickness: float, problems: list[str]
             else:
                 new_contour.append((a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1])))
                 slit_index[name] = len(new_contour) - 1
-    return Outline(section, tuple(new_contour), new_le, slit_index, features)
+    return Outline(section, tuple(new_contour), new_le, slit_index, features, branch_index)
+
+
+def _insert_points(points: list[Point], found: list[tuple[int, float, str]]) -> tuple[list[Point], dict[str, int]]:
+    """A closed polygon with the slit points (edge, fraction, name) inserted, and their indices."""
+    n = len(points)
+    by_edge: dict[int, list[tuple[float, str]]] = {}
+    for edge, s, name in found:
+        if s >= 1 - 1e-9:  # at the end of the edge: the next edge's first vertex
+            edge, s = (edge + 1) % n, 0.0
+        by_edge.setdefault(edge, []).append((s, name))
+    out: list[Point] = []
+    index: dict[str, int] = {}
+    for i in range(n):
+        out.append(points[i])
+        a, b = points[i], points[(i + 1) % n]
+        for s, name in sorted(by_edge.get(i, [])):
+            if s <= 1e-9:
+                index[name] = len(out) - 1
+            else:
+                out.append((a[0] + s * (b[0] - a[0]), a[1] + s * (b[1] - a[1])))
+                index[name] = len(out) - 1
+    return out, index
+
+
+def channel_parent(f: Feature, features: tuple[Feature, ...]) -> Feature | None:
+    """§8: the hole the channel of `f` ends in, or None if it ends outside the outer contour."""
+    if not f.channel:
+        return None
+    for other in features:
+        if other.name != f.name and other.kind == "hole" and g.inside(f.channel[-1], list(other.points)):
+            return other
+    return None
 
 
 def channel_problem(
@@ -178,17 +248,27 @@ def channel_problem(
     features: tuple[Feature, ...],
     feature_edges: dict[str, list[tuple[Point, Point]]],
 ) -> str:
-    """§8 Channels: what is wrong with the channel of `f`, or "" if nothing."""
+    """§8 Channels: what is wrong with the channel of `f`, or "" if nothing. The
+    channel ends outside the outer contour, or inside another hole (its parent)."""
     pts = [f.points[0], *f.channel]
     if any(g.dist(a, b) < 1e-9 for a, b in itertools.pairwise(pts)):
         return "has two equal points in a row"
     if not all(g.inside(p, contour) for p in f.channel[:-1]):
         return "leaves the outer contour before its last point"
-    if g.inside(f.channel[-1], contour):
-        return "must end outside the outer contour (its last point is inside)"
+    parent = channel_parent(f, features)
     path_edges = g.edges(pts, closed=False)
-    if g.any_crossing(path_edges[:-1], outer_edges):
-        return "crosses the outer contour before its last segment"
+    if parent is None:
+        if g.inside(f.channel[-1], contour):
+            return "must end outside the outer contour or inside another hole (its last point is in the foam)"
+        if g.any_crossing(path_edges[:-1], outer_edges):
+            return "crosses the outer contour before its last segment"
+    else:
+        if g.any_crossing(path_edges, outer_edges):
+            return "crosses the outer contour"
+        if any(g.inside(p, list(parent.points)) for p in f.channel[:-1]) or g.any_crossing(
+            path_edges[:-1], feature_edges[parent.name]
+        ):
+            return f'enters hole "{parent.name}" before its last segment'
     for a in range(len(path_edges)):
         for b in range(a + 2, len(path_edges)):
             if g.segments_cross(*path_edges[a], *path_edges[b]):
@@ -198,7 +278,7 @@ def channel_problem(
     ):
         return "runs into its own feature"
     for other in features:
-        if other.name == f.name:
+        if other.name == f.name or (parent is not None and other.name == parent.name):
             continue
         if g.any_crossing(path_edges, feature_edges[other.name]) or (
             other.kind == "hole" and any(g.inside(p, list(other.points)) for p in f.channel)

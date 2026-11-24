@@ -329,6 +329,20 @@ first point. Channel points go through §6.4 and §6.5 like feature points. Like
 a straight slit, a channel is cut but is not part of the target geometry. A
 straight slit in any direction is a channel of one point.
 
+**Channels into another hole.** A channel may instead end inside another
+feature of `kind: "hole"`, its **parent**: every channel point except the last
+lies strictly inside the outer contour and outside every hole, and the last
+lies strictly inside the parent. Only the last segment crosses the parent's
+edges; the slit point is the first point where it does, and it must lie on
+the same edge of the parent (the same pair of neighbouring points) at root and
+tip. The channel must not cross the outer contour, any other feature, or
+itself, and must not cross its own feature's edges except at its first point.
+`slit` is not checked for such a channel. The parent must have the same name
+at root and tip, and following parents from feature to feature must end at a
+feature whose slit meets the outer contour; a loop of features that only lead
+into each other is invalid. A hole may be the parent of several features. The
+slit point is inserted into the parent's points as an extra vertex.
+
 **Order.** Along the cutting direction (§10.1) the slit points of root and tip
 must occur in the same order of feature names. If not, the job is invalid.
 
@@ -360,7 +374,8 @@ The start point is called `S`.
 
 These points are matched one to one between root and tip: `S`, the leading
 edge, the far trailing-edge point, the slit points, every vertex of every
-feature, and every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
+feature (with the slit points of channels into another hole inserted, §8), and
+every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
 vertices. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
 the placed contours of §6.5, in each section plane. Twist and placement are a
 rotation and a translation, so lengths and angles are the same in both frames.
@@ -414,6 +429,9 @@ Feature vertices are not resampled.
    move for a straight slit; for a channel, one move per channel segment,
    through the channel points in reverse order), then
    - hole: around the feature through all vertices and back to its first point;
+     on reaching the slit point of a feature whose channel ends in this hole
+     (§8), that feature is cut the same way (into it along its channel, around
+     it, and out again to the slit point) before going on around this hole;
    - open: along the vertices to the last one, then back through them in reverse
      to the first;
    then back along the slit the same way to the slit point (the **channel
@@ -510,7 +528,8 @@ a straight line from where it is to `safe_position` without touching foam.
    its own.
 7. Slits, lead-ins, exits and `open` features are not offset. A slit runs
    straight from the offset slit point to the offset first vertex of its
-   feature.
+   feature. For a channel into another hole the slit point is the parent's
+   offset inserted vertex.
 8. If a vertex moves by more than 4 × the larger half kerf of its two edges,
    the CAM stops with an error naming the section and the point, rather than
    cutting a spike.

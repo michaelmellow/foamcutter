@@ -640,3 +640,127 @@ Open questions for the project director:
 - whether the rapid exit should also be the default for jobs written by
   hand (the CAM's default is still the cut speed, so old jobs are unchanged);
 - updating the simulator for `table_z` and the opening lift.
+
+## 11. Channels into another hole, and a Cut button (owner's request)
+
+Request: channel edits should not re-run the cut on every change; a Cut button
+makes the slit. A channel may end in another hole ("pocket"), as long as the
+chain of channels finally reaches the outside.
+
+Format change (`docs/formats/job-file.md`, needs approval like section 10):
+- §8 new paragraph **Channels into another hole**: the last channel point
+  may lie inside another `hole` (the parent). Only the last segment crosses
+  the parent's edges; the slit point is the first crossing and must be on the
+  same parent edge at root and tip. `slit` is not checked for such a channel.
+  Following parents must end at a feature whose slit meets the outer contour;
+  loops are invalid. The slit point becomes an extra vertex of the parent.
+- §10.2: the inserted vertices are fixed pairs like the other feature vertices.
+- §10.4: going round a hole, the wire cuts each child at its slit point (in
+  along its channel, round, out again) before going on round the parent.
+- §10.7 item 7: the slit of a child starts at the parent's offset vertex.
+
+Built:
+- CAM (`foamcam/sections.py`, `cam.py`): `channel_parent`, the rules above in
+  `channel_problem`, slit points inserted into the parent (`Outline.branch_index`),
+  loop check, root/tip same-parent/same-edge check, recursive `Cam.visit`.
+  Channel exits out of a child (rapid by default) end at the parent's vertex.
+- Simulator (`foamsim/target.py`): finds the parent, places the slit up to
+  the parent's edge, excludes the parent from the slit-crossing check, loop
+  check, root/tip same parents.
+- Front end (`holes.py`): a drawn channel ends at the first thing its line
+  meets, outer contour or another hole (`ChannelPath.into`). The parent gets
+  two vertices 0.25 mm before and after the slit point, matched root to tip
+  like corners, so the channel crosses the same edge at both ends.
+  `channel_problems` reports loops. The job summary says "into holeN".
+- GUI: edits (fields, drags, shape, Reset) only redraw the dashed channel and
+  show "changed, not cut yet: press Cut"; the **Cut** button builds the job and
+  runs the CAM (a failing channel keeps the last good cut on screen, as before).
+  The timer that re-ran the CAM 0.4 s after each edit is gone.
+
+Verified:
+- `check.py cam` and `check.py dxf` pass. New tests: 3 CAM (order of moves into
+  and out of a child, rapid exits, rules: loop, early entry, different parent,
+  different edge), 3 simulator (two programs with nested channels pass, loop
+  rejected), front end (channel into hole2 through job, CAM and slit indices;
+  loop reported; preview gives `into`; window test now checks that editing does
+  not cut and Cut does).
+- Two front-end tests that expected "crosses feature hole2" for a channel
+  pointed at hole2 now test a loop instead: that channel is valid by design.
+- Screenshot of the editor with hole1's curved channel ending in hole2.
+- `check.py sim`: same 19 failures as before (`table_z`, opening lift); the
+  channel tests all pass.
+
+NOT verified:
+- anything on the machine; the thin foam bridge left between two holes joined
+  by a channel is weak, and the extra melting at the parent's slit vertex.
+- a child whose slit lands right next to the parent's own channel start is
+  refused ("too close"); not tested on real drawings.
+
+Open questions:
+- approval of the §8, §10.2, §10.4 and §10.7 changes;
+- whether Cut should apply only the selected hole (now it applies all edits).
+
+## 12. Picking STEP faces on a 3D view (owner's request)
+
+Request: the root and tip faces of a STEP model were picked from a text list
+(face number, size, position), which is ambiguous on models with many flat faces.
+
+Built:
+- `foamdxf/facepick.py`: a window (opened by "Pick faces on the model…" under
+  the face lists) that draws the model's edges in grey and every flat face
+  filled and numbered, the root blue and the tip orange, the face under the
+  mouse purple. Click a face to set the root or tip (after the root, the next
+  click sets the tip); drag rotates, right-drag pans, the wheel zooms,
+  double-click resets. Suggest, Swap, OK, Cancel. Below the view: both faces,
+  the span and chords, and the warnings from `sections` (OK is disabled while
+  the pair cannot be cut). OK writes both faces to the form and measures the
+  span as before. The text lists still work.
+- `step.py`: `StepModel.wire`, every edge of the model sampled coarsely
+  (60 points per curved edge), for drawing only.
+
+Verified:
+- `check.py dxf` passes; new tests: face boundary loops close, and a window
+  test clicks both caps the other way round, checks the span and that OK
+  updates the form.
+- Screenshot on WingEndChordSectionImprovedHoles.STEP (2 flat faces, 18 edges).
+
+NOT verified:
+- models with many flat faces (only the test wing and one owner model tried);
+  faces seen exactly edge-on are hard to click: rotate first.
+- the view keeps the model's own axes (z up), so a wing modelled along z
+  stands upright.
+
+## 13. Preview fix: rapid channel exits (owner's report)
+
+Symptom: with `channel_exit: "rapid"` the section view showed a second, straight
+line from each hole to the outer contour; the machine cut no such line.
+
+Cause: `pipeline.preview_geometry` built the wire path from the feed moves
+only, so the rapid moves back out along a channel were dropped and the path
+jumped straight from the last point in the hole to the next cutting point. The
+G-code was right (it has every rapid); only the preview was wrong.
+
+Fix: the preview path now holds every move from the first to the last feed,
+rapids included (phase "rapid"; time = slowest axis at its `max_rate`, no
+acceleration, for the scrubber only). The readout also knows the
+"channel_exit" phase, which a numeric `channel_exit` would have hit as an
+unknown key before. Test `test_preview_path_follows_rapid_channel_exits`;
+`check.py dxf` passes; screenshot shows single channel lines.
+
+## 14. Channel editor as a side pane (owner's request)
+
+The channel settings moved from a row above the section view to a pane at its
+right, shown while "Edit channels" is on. Every hole has its own block: shape
+as radio buttons (Auto, Straight, Curved), Angle, Offset, Entry and Bend (only
+the ones the shape uses are enabled), Reset, and a note saying where the
+channel ends ("ends in hole1", "ends at the outer contour") or why it cannot
+be cut. The selected hole's block is framed in purple; clicking a hole or a
+handle on the drawing selects it and scrolls its block into view. Cut and the
+"not cut yet" note are under the list. Problems are no longer written over the
+drawing. The blocks are rebuilt after a Preview or Cut when the holes change.
+
+Verified: `check.py dxf` passes; the window test now edits two holes through
+their own blocks and checks the notes and that the pane hides again;
+screenshots of the pane.
+NOT verified: the pane with many holes beyond scrolling with the scrollbar (the
+mouse wheel does not scroll the list).

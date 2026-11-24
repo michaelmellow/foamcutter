@@ -41,12 +41,17 @@ def section(y: float, features: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def job(tmp_path: Path, channel: list[list[float]] | None = None, tip_channel: list[list[float]] | None = None,
-        other: bool = False, **top: Any) -> Any:
-    def features(ch: list[list[float]] | None) -> list[dict[str, Any]]:
+        other: bool = False, other_channel: list[list[float]] | None = None,
+        tip_other_channel: list[list[float]] | None = None, **top: Any) -> Any:
+    def features(ch: list[list[float]] | None, other_ch: list[list[float]] | None) -> list[dict[str, Any]]:
         hole: dict[str, Any] = {"name": "spar", "kind": "hole", "slit": "upper", "points": HOLE}
         if ch is not None:
             hole["channel"] = ch
-        extra = [{"name": "other", "kind": "hole", "slit": "upper", "points": OTHER}] if other else []
+        extra: list[dict[str, Any]] = []
+        if other or other_ch is not None:
+            extra.append({"name": "other", "kind": "hole", "slit": "upper", "points": OTHER})
+            if other_ch is not None:
+                extra[0]["channel"] = other_ch
         return [hole, *extra]
 
     data: dict[str, Any] = {
@@ -54,8 +59,9 @@ def job(tmp_path: Path, channel: list[list[float]] | None = None, tip_channel: l
         "cut_speed": 100.0, "direction": "upper_first", "max_segment_length": 10.0, "min_te_thickness": 0.0,
         "lead_in": 10.0, "safe_position": [230.0, 100.0, 230.0, 100.0], "mirror": False,
         "block": {"x": 90.0, "length": 120.0, "height": 80.0},
-        "root": section(ROOT_Y, features(channel)),
-        "tip": section(TIP_Y, features(tip_channel if tip_channel is not None else channel)),
+        "root": section(ROOT_Y, features(channel, other_channel)),
+        "tip": section(TIP_Y, features(tip_channel if tip_channel is not None else channel,
+                                       tip_other_channel if tip_other_channel is not None else other_channel)),
         **top,
     }
     path = tmp_path / "job.yaml"
@@ -163,3 +169,47 @@ def test_channel_lists_must_match_and_exit_must_be_valid(tmp_path: Path) -> None
         job(tmp_path, channel_exit="fast")
     with pytest.raises(ValidationError, match="channel_exit"):
         job(tmp_path, channel_exit=0)
+
+
+# "other" (u 70 to 80) reached through the spar: from its corner (70, -6) to (55, -10), then
+# into the spar across its right side u = 50 at v = -10.
+INTO_SPAR = [[55.0, -10.0], [45.0, -10.0]]
+
+
+def test_channel_into_another_hole_is_cut_from_inside_it(tmp_path: Path) -> None:
+    moves = motions(run(tmp_path, other_channel=INTO_SPAR))
+    feeds = [p for cmd, p, _ in moves if cmd == "G1"]
+    junction = placed(50.0 - 0.1, -10.0)  # the slit point on the spar's right side, compensated into the hole
+    bend, corner = placed(55.0, -10.0), placed(70.0, -6.0)
+    at_j = [i for i, p in enumerate(feeds) if near(p, junction, 0.01)]
+    at_bend = [i for i, p in enumerate(feeds) if near(p, bend)]
+    assert len(at_j) == 2 and len(at_bend) == 2  # in through the spar's new vertex, and back out
+    assert at_j[0] < at_bend[0] < at_bend[1] < at_j[1]
+    inside = feeds[at_bend[0] + 1 : at_bend[1]]
+    assert near(inside[0], (corner[0] + 0.1, corner[1] - 0.1), 0.01)  # other's first corner, into the hole
+    assert all(p[0] > bend[0] for p in inside)  # around "other" only
+    first = (corner[0] + 0.1, corner[1] - 0.1)
+    assert sum(near(p, first, 0.01) for p in feeds) == sum(near(p, first, 0.01) for p in inside) == 2  # once round
+
+
+def test_rapid_exit_from_a_nested_channel(tmp_path: Path) -> None:
+    moves = motions(run(tmp_path, other_channel=INTO_SPAR, channel_exit="rapid"))
+    feeds = [i for i, m in enumerate(moves) if m[0] == "G1"]
+    inner = [i for i, m in enumerate(moves) if m[0] == "G0" and feeds[0] < i < feeds[-1]]
+    junction = placed(50.0 - 0.1, -10.0)
+    # out of "other": to the bend, to the spar's vertex; then later out of the spar's slit
+    assert len(inner) == 3
+    assert near(moves[inner[0]][1], placed(55.0, -10.0)) and near(moves[inner[1]][1], junction, 0.01)
+    assert moves[inner[1] + 1][0] == "G1"  # on around the spar
+
+
+def test_nested_channel_rules(tmp_path: Path) -> None:
+    # a channel ending in the spar while the spar's own slit leads into "other": a loop
+    with pytest.raises(ValidationError, match="only lead into each other"):
+        run(tmp_path, channel=[[60.0, -3.0], [75.0, -8.0]], other_channel=INTO_SPAR)
+    with pytest.raises(ValidationError, match='enters hole "spar" before its last segment'):
+        run(tmp_path, other_channel=[[45.0, -10.0], [45.0, -12.0]])
+    with pytest.raises(ValidationError, match="ends in .spar. at the root but not at the tip"):
+        run(tmp_path, other_channel=INTO_SPAR, tip_other_channel=[[60.0, -10.0], [75.0, 5.0]])
+    with pytest.raises(ValidationError, match="different edge"):  # top side at the tip, right side at the root
+        run(tmp_path, other_channel=INTO_SPAR, tip_other_channel=[[48.0, -3.0], [45.0, -8.0]])

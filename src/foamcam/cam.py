@@ -79,6 +79,19 @@ def validate(job: Job, profile: Profile) -> tuple[Outline, Outline]:
         and fixed_points(root, job.direction)[1] != fixed_points(tip, job.direction)[1]
     ):
         problems.append("features: the slit points occur in a different order at the root and the tip")
+    if root is not None and tip is not None:
+        for name, (parent, index) in root.branch_index.items():
+            other = tip.branch_index.get(name)
+            if other is None or other[0] != parent:
+                problems.append(f'features: the channel of "{name}" ends in "{parent}" at the root but not at the tip')
+            elif other[1] != index:
+                problems.append(
+                    f'features: the channel of "{name}" meets "{parent}" on a different edge at the root '
+                    f"(before point {index}) and the tip (before point {other[1]}); §8 needs the same edge"
+                )
+        for name in tip.branch_index.keys() - root.branch_index.keys():
+            problems.append(f'features: the channel of "{name}" ends in "{tip.branch_index[name][0]}" '
+                            "at the tip but not at the root")
     if problems or root is None or tip is None:
         raise ValidationError("job file", problems)
     return root, tip
@@ -265,19 +278,31 @@ class Cam:
             name = tags[i] if i < n_outer else None
             if name is None:
                 continue
-            feature = self.root.features[name]
-            k = len(feature.points)
-            if feature.kind == "hole":
-                order = list(range(k)) + [0]
-            else:
-                order = list(range(k)) + list(range(k - 2, -1, -1))
-            channel: list[Ref] = [("channel", name, j) for j in range(len(feature.channel) - 1)]
-            refs += channel[::-1]
-            refs += [("feature", name, v) for v in order]
-            for ref in [*channel, ("outer", i % n_outer)]:
-                exits.add(len(refs))
-                refs.append(ref)
+            self.visit(name, ("outer", i % n_outer), refs, exits)
         return refs, exits
+
+    def visit(self, name: str, back: Ref, refs: list[Ref], exits: set[int]) -> None:
+        """§10.4: into a feature along its channel, around it (and into every feature
+        whose channel ends in it, at that slit point), and back out to `back`."""
+        feature = self.root.features[name]
+        k = len(feature.points)
+        if feature.kind == "hole":
+            order = list(range(k)) + [0]
+        else:
+            order = list(range(k)) + list(range(k - 2, -1, -1))
+        children: dict[int, list[str]] = {}
+        for child, (parent, index) in sorted(self.root.branch_index.items()):
+            if parent == name:
+                children.setdefault(index, []).append(child)
+        channel: list[Ref] = [("channel", name, j) for j in range(len(feature.channel) - 1)]
+        refs += channel[::-1]
+        for v in order:
+            refs.append(("feature", name, v))
+            for child in children.pop(v, []):
+                self.visit(child, ("feature", name, v), refs, exits)
+        for ref in [*channel, back]:
+            exits.add(len(refs))
+            refs.append(ref)
 
     def offset_face(self, outline: Outline, placed: list[Point], half: list[float], outward: bool, where: str) -> list[Point]:
         """Offset one face's polygon (§10.7), with the guard against spikes."""

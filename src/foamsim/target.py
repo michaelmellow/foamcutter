@@ -158,6 +158,53 @@ def _channel_slit_point(
     return (ua + t * (ub - ua), va + t * (vb - va)), pos
 
 
+def _parent(channel: Sequence[Point], name: str, holes: dict[str, list[Point]]) -> str | None:
+    """Section 8: the hole a channel ends in (its parent), or None."""
+    end = as_array(channel[-1:])
+    for other, pts in holes.items():
+        if other != name and bool(inside(end, as_array(pts))[0]):
+            return other
+    return None
+
+
+def _branch_point(
+    contour: list[Point], first: Point, channel: Sequence[Point], parent: list[Point]
+) -> Point | str:
+    """Section 8 channels into another hole: the slit point on the parent's edge,
+    or what is wrong with the channel."""
+    poly, hole = as_array(contour), as_array(parent)
+    if len(channel) > 1 and not bool(np.all(inside(as_array(channel[:-1]), poly))):
+        return "leaves the outer contour"
+    if len(channel) > 1 and bool(np.any(inside(as_array(channel[:-1]), hole))):
+        return "enters its parent hole before its last segment"
+    pts = [first, *channel]
+    for k in range(len(pts) - 1):
+        a, b = np.array(pts[k], dtype=float), np.array(pts[k + 1], dtype=float)
+        for j in range(len(contour)):
+            if segments_intersect(a, b, poly[j], poly[(j + 1) % len(contour)]):
+                return "crosses the outer contour"
+        if k < len(pts) - 2:
+            for j in range(len(parent)):
+                if segments_intersect(a, b, hole[j], hole[(j + 1) % len(parent)]):
+                    return "enters its parent hole before its last segment"
+    (ua, va), (ub, vb) = pts[-2], pts[-1]
+    best: float | None = None
+    m = len(parent)
+    for j in range(m):
+        (pa, qa), (pb, qb) = parent[j], parent[(j + 1) % m]
+        du, dv, eu, ev = ub - ua, vb - va, pb - pa, qb - qa
+        den = du * ev - dv * eu
+        if den == 0:
+            continue
+        t = ((pa - ua) * ev - (qa - va) * eu) / den
+        s = ((pa - ua) * dv - (qa - va) * du) / den
+        if 0 <= t <= 1 and 0 <= s <= 1 and (best is None or t < best):
+            best = t
+    if best is None:
+        return "does not meet its parent hole"
+    return ua + best * (ub - ua), va + best * (vb - va)
+
+
 def _self_crossing(polygon: Arr) -> bool:
     a, b = segments(polygon, closed=True)
     keep = [i for i in range(len(a)) if not np.array_equal(a[i], b[i])]
@@ -192,6 +239,7 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
     span = profile.wire_span
     targets: dict[str, SectionTarget] = {}
     order: dict[str, list[str]] = {}
+    all_parents: dict[str, dict[str, str]] = {}
     for s in job.sections:
         if not 0 < s.y < span:
             errors.append(f"{s.label}.position.y: must lie between 0 and wire_span {span:g}")
@@ -217,6 +265,8 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
             )
 
         positions: list[tuple[float, str]] = []
+        raw_holes = {f.name: list(f.points) for f in s.features if f.kind == "hole"}
+        parents: dict[str, str] = {}
         for i, f in enumerate(s.features):
             p = f"{s.label}.features[{i}]"
             placed = _place_section(f.points, s)
@@ -228,6 +278,16 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
                     closed and bool(np.any(inside(other, placed)))
                 ) or (other_name in target.holes and bool(np.any(inside(placed, other)))):
                     errors.append(f'{p}: touches the feature "{other_name}"')
+            parent = _parent(f.channel, f.name, raw_holes) if f.channel else None
+            if parent is not None:
+                branch = _branch_point(contour, f.points[0], f.channel, raw_holes[parent])
+                if isinstance(branch, str):
+                    errors.append(f"{p}.channel: the channel {branch}")
+                    continue
+                parents[f.name] = parent
+                (target.holes if closed else target.opens)[f.name] = placed
+                target.slits[f.name] = _place_section([f.points[0], *f.channel[:-1], branch], s)
+                continue
             if f.channel:
                 found = _channel_slit_point(contour, i_le, f.points[0], f.channel, f.slit)
                 if isinstance(found, str):
@@ -249,8 +309,18 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
             )
         for name, slit in target.slits.items():  # a channel must not cut into another feature
             for other_name, other in [*target.holes.items(), *target.opens.items()]:
-                if other_name != name and _crosses(slit, False, other, other_name in target.holes):
+                if other_name in (name, parents.get(name)):
+                    continue
+                if _crosses(slit, False, other, other_name in target.holes):
                     errors.append(f'{s.label}: the slit of "{name}" crosses the feature "{other_name}"')
+        for name in parents:  # following the parents must reach the outer contour
+            seen = [name]
+            while seen[-1] in parents and parents[seen[-1]] not in seen:
+                seen.append(parents[seen[-1]])
+            if seen[-1] in parents:
+                errors.append(f'{s.label}: the channel of "{name}" never leads to the outer contour')
+                break
+        all_parents[s.label] = parents
         order[s.label] = [name for _, name in sorted(positions)]
         targets[s.label] = target
 
@@ -260,6 +330,8 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
             "features: the slit points of root and tip are not in the same order along "
             "the cutting direction"
         )
+    if "root" in all_parents and "tip" in all_parents and all_parents["root"] != all_parents["tip"]:
+        errors.append("features: the channels end in different holes at the root and the tip")
     if errors:
         raise InputError(errors)
     return targets

@@ -170,7 +170,8 @@ def build_job(
         ),
         f"safe position [{x_entry:.1f}, {z_safe:.1f}, {x_entry:.1f}, {z_safe:.1f}]",
     ) + tuple(
-        f"{h.name}: {len(h.root)} points, {_channel_kind(h)} from the {h.slit} side, "
+        f"{h.name}: {len(h.root)} points, {_channel_kind(h)} "
+        + (f"into {h.into} (cut from inside it), " if h.into else f"from the {h.slit} side, ") +
         f"{h.channel_lengths[0]:.1f} mm (root) / {h.channel_lengths[1]:.1f} mm (tip) long"
         for h in holes
     ) + ((f"channel exit: {_exit_text(settings.channel_exit, settings.cut_speed)}",) if holes else ())

@@ -113,7 +113,7 @@ class PreviewGeometry:
     tip_y: float
     times: list[float]  # minutes from the entry point to each path point
     letters: tuple[str, str, str, str]  # G-code letters of axes 1 to 4
-    phases: list[str]  # per path point: "entry", then the move kind: "lead_in", "cut" or "exit"
+    phases: list[str]  # per path point: "entry", then the move kind: "lead_in", "cut", "channel_exit", "rapid", "exit"
     safe_position: tuple[float, float, float, float]  # axes 1 to 4
     root_holes: tuple[list[Point], ...] = ()  # inner contours (features), placed, at the root face
     tip_holes: tuple[list[Point], ...] = ()
@@ -131,13 +131,15 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
         targets.append([outline.place(p) for p in outline.contour])
         holes.append(tuple([outline.place(p) for p in f.points] for f in section.features if f.kind == "hole"))
 
-    # the wire path from the entry point (end of the last rapid before the cut) to the exit
+    # the wire path from the entry point (end of the last rapid before the cut) to the exit,
+    # with the rapid channel exits inside the cut (§10.4): the machine runs them too
     first = next(i for i, m in enumerate(result.moves) if m.kind != "rapid")
-    feed_moves = [m for m in result.moves if m.kind != "rapid"]
+    last = max(i for i, m in enumerate(result.moves) if m.kind != "rapid")
+    feed_moves = result.moves[first : last + 1]
     feeds = [result.moves[first - 1].axes] + [m.axes for m in feed_moves]
     times = [0.0]
-    for m in feed_moves:
-        times.append(times[-1] + m.duration)
+    for k, m in enumerate(feed_moves):
+        times.append(times[-1] + (m.duration if m.kind != "rapid" else _rapid_minutes(feeds[k], m.axes, profile)))
 
     def at_plane(y: float) -> list[Point]:
         s = y / profile.wire_span
@@ -164,6 +166,11 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
         root_holes=holes[0],
         tip_holes=holes[1],
     )
+
+
+def _rapid_minutes(start: tuple[float, ...], end: tuple[float, ...], profile: Profile) -> float:
+    """Shortest time of a rapid move: the slowest axis at its max_rate (no acceleration)."""
+    return max(abs(b - a) / axis.max_rate for a, b, axis in zip(start, end, profile.axes, strict=True))
 
 
 @dataclass(frozen=True)

@@ -8,7 +8,8 @@ import pytest
 
 ezdxf = pytest.importorskip("ezdxf")
 
-from foamcam.cam import generate
+from foamcam.cam import generate, validate
+from foamcam.geometry import inside
 from foamcam.job import RAPID, load_job_text
 from foamcam.profile import Profile, load_profile
 from foamdxf.errors import DxfError
@@ -115,16 +116,42 @@ def test_curved_channel_leaves_the_hole_along_its_edge(dxfs: tuple[Path, Path], 
 def test_bad_channels_name_the_hole(dxfs: tuple[Path, Path], profile: Profile) -> None:
     with pytest.raises(DxfError, match="hole1.*misses the hole"):
         job(dxfs, profile, channels={"hole1": ChannelSpec("straight", 90.0, 5.0)})
-    # pointing at the lightening hole behind it: through hole2
-    with pytest.raises(DxfError, match='crosses feature "hole2"'):
-        job(dxfs, profile, channels={"hole1": ChannelSpec("straight", 0.0, 0.0)})
+    # the spar's channel ends in the lightening hole and that hole's channel back in the spar: no way out
+    loop = {"hole1": ChannelSpec("straight", 0.0, 0.0), "hole2": ChannelSpec("straight", 180.0, 0.0)}
+    with pytest.raises(DxfError, match="never reach the outer contour"):
+        job(dxfs, profile, channels=loop)
+
+
+def test_channel_into_another_hole(dxfs: tuple[Path, Path], profile: Profile, tmp_path: Path) -> None:
+    # pointing at the lightening hole behind it: the spar is reached from inside hole2
+    text = job(dxfs, profile, channels={"hole1": ChannelSpec("straight", 0.0, 0.0)})
+    placement = Placement(span=300, stock_length=220, stock_height=40)
+    generated = build_job(read_outline(dxfs[0]), read_outline(dxfs[1]), profile, placement,
+                          CutSettings(channels={"hole1": ChannelSpec("straight", 0.0, 0.0)}))
+    assert [h.into for h in generated.holes] == ["hole2", ""]
+    assert "into hole2" in "\n".join(generated.summary)
+    parsed = load_job_text(text, tmp_path)
+    for section in (parsed.root, parsed.tip):
+        spar_f, other = section.features
+        assert len(spar_f.channel) == 1  # a straight line from the spar into hole2
+        assert inside(spar_f.channel[-1], list(other.points))  # §8: the last point lies inside the parent
+    assert generate(parsed, profile).total_time > 0
+    # only hole2 has a slit on the outer contour; the spar's slit point is a vertex of hole2,
+    # at the same index at root and tip (two vertices were added around it, §8)
+    root, tip = validate(parsed, profile)
+    assert set(root.slit_index) == set(tip.slit_index) == {"hole2"}
+    assert root.branch_index["hole1"] == tip.branch_index["hole1"]
+    assert root.branch_index["hole1"][0] == "hole2"
 
 
 def test_preview_reports_problems_without_the_cam(dxfs: tuple[Path, Path], profile: Profile) -> None:
     placement = Placement(span=300, stock_length=220, stock_height=40)
     good = build_job(read_outline(dxfs[0]), read_outline(dxfs[1]), profile, placement, CutSettings())
-    found = preview_channels(good.holes, {"hole1": ChannelSpec("straight", 0.0, 0.0)}, good.outers)
-    assert set(found) == {"hole1"} and 'crosses feature "hole2"' in found["hole1"].problem
+    loop = {"hole1": ChannelSpec("straight", 0.0, 0.0), "hole2": ChannelSpec("straight", 180.0, 0.0)}
+    found = preview_channels(good.holes, loop, good.outers)
+    assert set(found) == {"hole1", "hole2"} and "never reach the outer contour" in found["hole1"].problem
+    into = preview_channels(good.holes, {"hole1": ChannelSpec("straight", 0.0, 0.0)}, good.outers)["hole1"]
+    assert into.problem == "" and into.root is not None and into.root.into == "hole2"
     ok = preview_channels(good.holes, {"hole1": ChannelSpec("straight", 100.0, 0.5)}, good.outers)
     assert ok["hole1"].problem == "" and ok["hole1"].root is not None
 
@@ -189,10 +216,12 @@ def test_window_edits_a_channel_by_dragging(dxfs: tuple[Path, Path], tmp_path: P
         assert win.preview()
         win.edit_channels.set(True)
         win._edit_channels_changed()
-        assert win.ch_hole_box.cget("values") == ("hole1", "hole2")
+        assert list(win.ch_rows) == ["hole1", "hole2"]  # one block per hole in the pane
+        assert win.channel_pane.winfo_manager() == "pack"
         assert not win.channel_handles  # automatic channels have no handles
-        win.ch_vars["shape"].set("straight")
-        win._channel_shape_changed()  # starts straight up, from the automatic upper slit
+        assert win.ch_rows["hole2"].note.get().startswith("automatic")
+        win.ch_rows["hole1"].vars["shape"].set("straight")  # the radio button
+        win._channel_shape_changed("hole1")  # starts straight up, from the automatic upper slit
         assert specs_from_text(win.vars["channels"].get())["hole1"] == ChannelSpec("straight", 90.0, 0.0)
         assert ("hole1", "angle") in win.channel_handles
 
@@ -206,16 +235,56 @@ def test_window_edits_a_channel_by_dragging(dxfs: tuple[Path, Path], tmp_path: P
         win._release(SimpleNamespace(x=target[0], y=target[1]))  # type: ignore[arg-type]
         spec = specs_from_text(win.vars["channels"].get())["hole1"]
         assert spec.angle == pytest.approx(135, abs=2)
-        win._channel_preview()  # what the timer runs after the drag
+        assert "channel:" not in win.plan.generated.text  # editing does not cut: the old cut stays
+        assert win.ch_pending.get().startswith("changed")
+        win._cut_channels()  # the Cut button
         assert win.plan is not None and "channel:" in win.plan.generated.text
+        assert win.ch_pending.get() == ""
 
         # an impossible channel keeps the last good cut on screen and says why
         good = win.plan
-        win.ch_vars["angle"].set("0")
-        win._channel_fields_changed()
-        win._channel_preview()
+        win.ch_rows["hole1"].vars["offset"].set("5")  # 5 mm beside the centre of a 3 mm hole: misses it
+        win._channel_fields_changed("hole1")
+        win.draw()
+        assert win.ch_rows["hole1"].note.get().startswith("cannot cut")
+        win._cut_channels()
         assert win.plan is good and win.status.get().startswith("Cannot cut this channel")
-        win._reset_channel()
+
+        # the other hole's block edits only that hole; a channel from hole2 into hole1 says so
+        win.ch_rows["hole2"].vars["shape"].set("straight")
+        win._channel_shape_changed("hole2")
+        win.ch_rows["hole2"].vars["angle"].set("180")
+        win._channel_fields_changed("hole2")
+        win._reset_channel("hole1")
+        win.draw()
+        assert win.ch_selected.get() == "hole1"
         assert "hole1" not in specs_from_text(win.vars["channels"].get())
+        assert specs_from_text(win.vars["channels"].get())["hole2"].angle == 180.0
+        assert win.ch_rows["hole2"].note.get() == "ends in hole1"
+        win.edit_channels.set(False)
+        win._edit_channels_changed()
+        assert win.channel_pane.winfo_manager() == ""
     finally:
         root.destroy()
+
+
+def test_preview_path_follows_rapid_channel_exits(dxfs: tuple[Path, Path], tmp_path: Path) -> None:
+    """The preview draws the wire back out along each channel, as the G-code runs it,
+    not a straight line from the hole to the next cut (the rapids were left out)."""
+    from foamdxf import gui
+    from foamdxf.pipeline import make_job, preview_geometry, run_cam
+
+    values = dict(gui.DEFAULTS) | {"root": str(dxfs[0]), "tip": str(dxfs[1]), "profile": str(PROFILE),
+                                   "span": "300", "stock_length": "220", "stock_height": "40",
+                                   "channels": specs_to_text({"hole1": ChannelSpec("curved", 90.0, 0.0, 30.0, 4.0)})}
+    plan = make_job(gui.request_from_form(values))
+    result = run_cam(plan)
+    geometry = preview_geometry(plan, result)
+    feeds = [i for i, m in enumerate(result.moves) if m.kind != "rapid"]
+    inner = [m.axes for m in result.moves[feeds[0] : feeds[-1]] if m.kind == "rapid"]
+    assert inner  # channel_exit "rapid" (the default)
+    assert geometry.phases.count("rapid") == len(inner)
+    path = list(zip(geometry.tower_12, geometry.tower_34, strict=True))
+    for a in inner:
+        assert any(math.dist(a, (*p, *q)) < 1e-9 for p, q in path)
+    assert all(b >= a for a, b in zip(geometry.times, geometry.times[1:]))
