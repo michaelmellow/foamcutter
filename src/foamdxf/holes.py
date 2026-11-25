@@ -20,15 +20,21 @@ tip drawings into matching `kind: "hole"` features:
   centre, or a curve that leaves the hole along its edge and bends round to
   that angle. Root and tip get the same spec, each about its own hole centre,
   so the two channels match point for point.
+- **Channels into another hole.** A drawn channel ends at the first thing its
+  line meets: the outer contour or another hole (§8 Channels into another
+  hole). Then the wire reaches it from inside that hole, its parent. The
+  parent gets two extra vertices just before and after the slit point at
+  root and tip, so the channel crosses the same edge of it at both ends.
 """
 
+import itertools
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from foamcam.geometry import inside
 from foamcam.job import Feature
-from foamcam.sections import channel_problem
+from foamcam.sections import channel_parent, channel_problem
 
 from .errors import DxfError
 from .outline import Point, signed_area
@@ -38,6 +44,8 @@ MIN_CIRCLE_POINTS = 16  # a hole without corners gets at least this many points
 CHANNELS = ("shortest", "upper", "lower")
 SHAPES = ("auto", "straight", "curved")  # auto: straight up or down, from the CHANNELS setting
 BEYOND_MM = 2.0  # a drawn channel's last point lies this far past the outer contour (§8)
+CLEAR_MM = 0.5  # a drawn channel's last point lies at least this far outside the outer contour
+SLIT_EDGE_MM = 0.25  # half the length of the parent edge a channel into another hole crosses
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,7 @@ class HolePair:
     root_drawn: tuple[Point, ...] = ()  # the hole as drawn (counter-clockwise), for the editor
     tip_drawn: tuple[Point, ...] = ()
     spec: ChannelSpec = field(default_factory=ChannelSpec)
+    into: str = ""  # the hole the channel ends in (§8), "" if it meets the outer contour
 
 
 def specs_from_text(text: str) -> dict[str, ChannelSpec]:
@@ -105,14 +114,34 @@ def pair_holes(
             "every hole must be drawn at both ends"
         )
     todo = list(tip_holes)
-    pairs = []
+    matched: dict[str, tuple[tuple[Point, ...], tuple[Point, ...]]] = {}
     for k, r in enumerate(sorted(root_holes, key=lambda h: _centre(h)[0])):
         t = min(todo, key=lambda h: math.dist(_centre(h), _centre(r)))
         todo.remove(t)
-        name = f"hole{k + 1}"
+        matched[f"hole{k + 1}"] = (r, t)
+    # drawn channels first: one ending in another hole marks its slit point on that hole
+    paths: dict[str, tuple[ChannelPath, ChannelPath]] = {}
+    marks: dict[str, list[tuple[Point, Point]]] = {}
+    for name, (r, t) in matched.items():
+        spec = (specs or {}).get(name, ChannelSpec())
+        if spec.shape == "auto":
+            continue
+        others_r = {n: rt[0] for n, rt in matched.items() if n != name}
+        others_t = {n: rt[1] for n, rt in matched.items() if n != name}
+        rc, tc = drawn_paths(name, spec, root_outer, r, tip_outer, t, max_segment, others_r, others_t)
+        paths[name] = (rc, tc)
+        if rc.into:
+            marks.setdefault(rc.into, []).append((rc.slit_point, tc.slit_point))
+    pairs = []
+    for k, (name, (r, t)) in enumerate(matched.items()):
         spec = (specs or {}).get(name, ChannelSpec())
         if spec.shape != "auto":
-            pairs.append(drawn_channel(name, spec, root_outer, r, tip_outer, t, max_segment))
+            rc, tc = paths[name]
+            rs = _start_at(r, rc.entry, rc.edge, rc.clockwise)
+            ts = _start_at(t, tc.entry, tc.edge, tc.clockwise)
+            r_pts, t_pts = _matched(rs, ts, max_segment, marks.get(name, []), name)
+            pairs.append(HolePair(name, rc.slit, r_pts, t_pts, (rc.length, tc.length), rc.points, tc.points,
+                                  _ccw(r), _ccw(t), spec, rc.into))
             continue
         sides = ("upper", "lower") if channel == "shortest" else (channel,)
         options = []
@@ -124,7 +153,7 @@ def pair_holes(
         if not options:
             raise DxfError(f"hole {k + 1}: a straight {' or '.join(sides)} channel does not reach the outer contour")
         _, side, rs, ts, lr, lt = min(options)
-        r_pts, t_pts = _matched(rs, ts, max_segment)
+        r_pts, t_pts = _matched(rs, ts, max_segment, marks.get(name, []), name)
         pairs.append(HolePair(name, side, r_pts, t_pts, (lr, lt), root_drawn=_ccw(r), tip_drawn=_ccw(t)))
     _check_channels(root_outer, [(p.name, p.slit, p.root, p.root_channel) for p in pairs], "root")
     _check_channels(tip_outer, [(p.name, p.slit, p.tip, p.tip_channel) for p in pairs], "tip")
@@ -140,13 +169,15 @@ class ChannelPath:
 
     entry: Point
     edge: int  # edge of the counter-clockwise hole the entry lies on
-    points: tuple[Point, ...]  # from the hole outward; the last lies BEYOND_MM past the outer contour
+    points: tuple[Point, ...]  # from the hole outward; the last lies past the outer contour (or inside `into`)
     slit: str  # side of the outer contour it meets: "upper" or "lower"
-    length: float  # from the entry to the outer contour, mm
+    length: float  # from the entry to the outer contour (or to `into`), mm
     clockwise: bool  # the hole is cut clockwise (a curved channel that turns right)
+    into: str = ""  # the other hole the channel ends in, "" if it meets the outer contour
+    slit_point: Point = (0.0, 0.0)  # where it meets the outer contour or `into`
 
 
-def drawn_channel(
+def drawn_paths(
     name: str,
     spec: ChannelSpec,
     root_outer: tuple[Point, ...],
@@ -154,20 +185,122 @@ def drawn_channel(
     tip_outer: tuple[Point, ...],
     tip_hole: tuple[Point, ...],
     max_segment: float,
-) -> HolePair:
-    """The feature pair for a hole with a drawn channel. Raises DxfError."""
-    rc = channel_path(spec, root_outer, root_hole, max_segment, where=f"{name} (root)")
-    tc = channel_path(spec, tip_outer, tip_hole, max_segment, bends=_bends(rc, spec),
-                      clockwise=rc.clockwise, where=f"{name} (tip)")
+    root_others: dict[str, tuple[Point, ...]] | None = None,
+    tip_others: dict[str, tuple[Point, ...]] | None = None,
+) -> tuple[ChannelPath, ChannelPath]:
+    """A hole's drawn channel at root and tip, checked to match. Raises DxfError.
+
+    The tip channel turns by a few degrees from `spec.angle` if needed, so that it
+    meets the outer contour (or the other hole) at the same place as the root one:
+    the same fraction of the way from the leading edge along that side, or the same
+    direction from the other hole's centre. Otherwise a shallow channel can meet the
+    two sections far apart, and the outer contour between two slits is then much
+    longer at one face than the other: that face crawls (below the kerf table)."""
+    rc = channel_path(spec, root_outer, root_hole, max_segment, where=f"{name} (root)", others=root_others)
+    angle = _matching_angle(spec, rc, tip_outer, tip_hole, max_segment, root_outer, root_others, tip_others)
+    tc = channel_path(replace(spec, angle=angle), tip_outer, tip_hole, max_segment, bends=_bends(rc, spec),
+                      clockwise=rc.clockwise, where=f"{name} (tip)", others=tip_others)
     if len(rc.points) != len(tc.points):  # the bend steps follow the root: always equal
         raise DxfError(f"{name}: the root and tip channels have different point counts")
-    if rc.slit != tc.slit:
+    if rc.into != tc.into:
+        raise DxfError(f"{name}: the channel runs into {_target(rc)} at the root but {_target(tc)} at the tip")
+    if not rc.into and rc.slit != tc.slit:
         raise DxfError(f"{name}: the channel meets the {rc.slit} side at the root but the {tc.slit} side at the tip")
-    rs = _start_at(root_hole, rc.entry, rc.edge, rc.clockwise)
-    ts = _start_at(tip_hole, tc.entry, tc.edge, tc.clockwise)
-    r_pts, t_pts = _matched(rs, ts, max_segment)
-    return HolePair(name, rc.slit, r_pts, t_pts, (rc.length, tc.length), rc.points, tc.points,
-                    _ccw(root_hole), _ccw(tip_hole), spec)
+    return rc, tc
+
+
+MATCH_SEARCH_DEGREES = 40  # the tip channel may turn this far from the spec to meet the same place
+MATCH_STEP_DEGREES = 2
+
+
+def _matching_angle(
+    spec: ChannelSpec,
+    rc: "ChannelPath",
+    tip_outer: tuple[Point, ...],
+    tip_hole: tuple[Point, ...],
+    max_segment: float,
+    root_outer: tuple[Point, ...],
+    root_others: dict[str, tuple[Point, ...]] | None,
+    tip_others: dict[str, tuple[Point, ...]] | None,
+) -> float:
+    """The tip channel's angle that meets the place the root channel meets (`spec.angle`
+    if none in reach does): found by stepping out from `spec.angle`, then halving."""
+    target = _slit_place(rc, root_outer, root_others)
+
+    def error(angle: float) -> float | None:
+        try:
+            tc = channel_path(replace(spec, angle=angle), tip_outer, tip_hole, max_segment,
+                              bends=_bends(rc, spec), clockwise=rc.clockwise, others=tip_others)
+        except DxfError:
+            return None
+        if tc.into != rc.into or (not rc.into and tc.slit != rc.slit):
+            return None
+        e = _slit_place(tc, tip_outer, tip_others) - target
+        return (e + 180) % 360 - 180 if rc.into else e  # a direction about the other hole, or a fraction
+
+    near = 90.0 if rc.into else 0.25  # a sign change bigger than this is a jump (round the trailing edge)
+    e0 = error(spec.angle)
+    if e0 is None or e0 == 0:
+        return spec.angle
+    for k in range(1, MATCH_SEARCH_DEGREES // MATCH_STEP_DEGREES + 1):
+        for step in (MATCH_STEP_DEGREES, -MATCH_STEP_DEGREES):
+            a, b = spec.angle + (k - 1) * step, spec.angle + k * step
+            ea, eb = error(a), error(b)
+            if ea is None or eb is None or ea * eb > 0 or abs(ea - eb) > near:
+                continue
+            for _ in range(30):
+                mid = (a + b) / 2
+                em = error(mid)
+                if em is None:
+                    break
+                if em * ea > 0:
+                    a, ea = mid, em
+                else:
+                    b = mid
+            return (a + b) / 2
+    return spec.angle
+
+
+def _slit_place(path: "ChannelPath", outer: tuple[Point, ...], others: dict[str, tuple[Point, ...]] | None) -> float:
+    """Where a channel meets: its direction (degrees) from the centre of the hole it ends
+    in, or how far along the outer contour from the leading edge (fraction of that side:
+    + on the upper side, - on the lower side)."""
+    if path.into and others and path.into in others:
+        c = area_centre(list(others[path.into]))
+        return math.degrees(math.atan2(path.slit_point[1] - c[1], path.slit_point[0] - c[0]))
+    loop = list(outer)
+    n = len(loop)
+    run = [0.0]
+    for i in range(n):
+        run.append(run[-1] + math.dist(loop[i], loop[(i + 1) % n]))
+    edge = min(range(n), key=lambda i: math.dist(path.slit_point, _foot(path.slit_point, loop[i], loop[(i + 1) % n])[0]))
+    _, f = _foot(path.slit_point, loop[edge], loop[(edge + 1) % n])
+    s = run[edge] + f * (run[edge + 1] - run[edge])
+    i_le = min(range(n), key=lambda i: (loop[i][0], i))
+    s_le, total = run[i_le], run[n]
+    return (s_le - s) / s_le if s <= s_le else -(s - s_le) / (total - s_le)
+
+
+def _clear_of(outer: list[Point], start: Point, d: Point, t_q: float, t_far: float, where: str) -> float:
+    """How far along the channel line its last point goes: at least BEYOND_MM past where it
+    leaves the foam, further if needed to be CLEAR_MM away from the outer contour, but not
+    past halfway to where the line comes back into the foam."""
+    limit = (t_far - t_q) / 2 if math.isfinite(t_far) else 50.0
+    step = min(BEYOND_MM, limit)
+    t_x = t_q + step
+    while True:
+        p = (start[0] + t_x * d[0], start[1] + t_x * d[1])
+        gap = min(math.dist(p, _foot(p, outer[i], outer[(i + 1) % len(outer)])[0]) for i in range(len(outer)))
+        if gap >= CLEAR_MM:
+            return t_x
+        if t_x - t_q >= limit - 1e-9:
+            raise DxfError(f"{where}: the channel only grazes the outer contour (its line runs within "
+                           f"{gap:.2f} mm of the outline); turn it more steeply")
+        t_x = min(t_x + step, t_q + limit)
+
+
+def _target(path: "ChannelPath") -> str:
+    return path.into if path.into else "the outer contour"
 
 
 def channel_path(
@@ -178,9 +311,11 @@ def channel_path(
     bends: int | None = None,
     clockwise: bool | None = None,
     where: str = "hole",
+    others: dict[str, tuple[Point, ...]] | None = None,
 ) -> ChannelPath:
     """One section's channel for `spec`. `bends` and `clockwise` force the bend's point
-    count and turning direction (the tip follows the root). Raises DxfError."""
+    count and turning direction (the tip follows the root). The channel ends at the
+    outer contour or at the first of the `others` holes its line meets. Raises DxfError."""
     loop = list(_ccw(hole))
     c = area_centre(loop)
     d = _unit(spec.angle)
@@ -220,10 +355,20 @@ def channel_path(
         raise DxfError(f"{where}: the channel never reaches the outer contour")
     out.sort()
     t_q, q_edge = out[0]
-    t_x = t_q + (min(BEYOND_MM, (out[1][0] - t_q) / 2) if len(out) > 1 else BEYOND_MM)
+    into, t_far = "", out[1][0] if len(out) > 1 else math.inf
+    for other, loop_o in (others or {}).items():
+        hits_o = sorted(t for t, _ in _line_hits(list(loop_o), start, d) if t > 1e-9)
+        if hits_o and hits_o[0] < t_q:
+            into, t_q = other, hits_o[0]
+            t_far = hits_o[1] if len(hits_o) > 1 else hits_o[0] + 2 * BEYOND_MM
+    t_x = t_q + min(BEYOND_MM, (t_far - t_q) / 2)
+    if not into:  # the last point must lie clearly outside: §6.2 may thicken the trailing edge
+        t_x = _clear_of(list(outer), start, d, t_q, t_far, where)
     last = (start[0] + t_x * d[0], start[1] + t_x * d[1])
     length = sum(math.dist(p, q) for p, q in zip([entry, *bend], bend)) + t_q
-    return ChannelPath(entry, edge, (*bend, last), _side(outer, q_edge), length, cw)
+    hit = (start[0] + t_q * d[0], start[1] + t_q * d[1])
+    side = ("upper" if d[1] >= 0 else "lower") if into else _side(outer, q_edge)  # §8: not checked into a hole
+    return ChannelPath(entry, edge, (*bend, last), side, length, cw, into, hit)
 
 
 def channel_problems(
@@ -236,11 +381,22 @@ def channel_problems(
     outer_edges = _edges(contour)
     feature_edges = {f.name: _edges(list(f.points)) for f in features}
     found = []
+    parents: dict[str, str] = {}
     for f in features:
         if f.channel:
             why = channel_problem(f, contour, outer_edges, features, feature_edges)
             if why:
                 found.append(f"{f.name}: the channel {why}")
+            parent = channel_parent(f, features)
+            if parent is not None:
+                parents[f.name] = parent.name
+    for name, parent_name in parents.items():  # §8: from hole to hole, the channels must reach the outside
+        seen = [name]
+        while seen[-1] in parents and parents[seen[-1]] not in seen:
+            seen.append(parents[seen[-1]])
+        if seen[-1] in parents:
+            found.append(f"{name}: the channel leads into {parent_name}, but the channels from there "
+                         "never reach the outer contour")
     return found
 
 
@@ -269,9 +425,9 @@ def preview_channels(
         problem = ""
         if spec.shape != "auto":
             try:
-                rc = channel_path(spec, outers[0], p.root_drawn, max_segment, where="root")
-                tc = channel_path(spec, outers[1], p.tip_drawn, max_segment, bends=_bends(rc, spec),
-                                  clockwise=rc.clockwise, where="tip")
+                rc, tc = drawn_paths(p.name, spec, outers[0], p.root_drawn, outers[1], p.tip_drawn, max_segment,
+                                     {q.name: q.root_drawn for q in pairs if q.name != p.name},
+                                     {q.name: q.tip_drawn for q in pairs if q.name != p.name})
             except DxfError as error:
                 problem = str(error)
             out[p.name] = ChannelPreview(rc, tc, problem)
@@ -463,20 +619,94 @@ def _resample(line: list[Point], n: int) -> list[Point]:
     return out
 
 
-def _matched(root: list[Point], tip: list[Point], max_segment: float) -> tuple[tuple[Point, ...], tuple[Point, ...]]:
+def _matched(
+    root: list[Point], tip: list[Point], max_segment: float,
+    marks: list[tuple[Point, Point]] | None = None, name: str = "hole",
+) -> tuple[tuple[Point, ...], tuple[Point, ...]]:
+    """Both loops re-sampled into the same number of points, piece by piece between
+    matching corners. Each mark (a slit point at root and tip) gets a vertex just
+    before and just after it, matched like corners, so a channel into this hole
+    crosses the same edge at both ends (§8)."""
+    root, tip = list(root), list(tip)
+    smooth = len(_corners(root)) == len(_corners(tip)) == 1
+    added_r: list[Point] = []
+    added_t: list[Point] = []
+    for hr, ht in marks or []:
+        added_r += _around(root, hr, name)
+        added_t += _around(tip, ht, name)
+    root, extra_r = _with_points(root, added_r)
+    tip, extra_t = _with_points(tip, added_t)
     cr, ct = _corners(root), _corners(tip)
-    if len(cr) != len(ct):  # different shapes: match as smooth loops
-        cr, ct = [0], [0]
+    br, bt = sorted(set(cr) | set(extra_r)), sorted(set(ct) | set(extra_t))
+    if len(br) != len(bt):  # different shapes: match as smooth loops, with the marks only
+        br, bt = sorted({0} | set(extra_r)), sorted({0} | set(extra_t))
+    if len(br) != len(bt):
+        raise DxfError(f"{name}: the channels into this hole do not match at the root and the tip")
     out_r: list[Point] = []
     out_t: list[Point] = []
-    pieces = list(zip(_pieces(root, cr), _pieces(tip, ct), strict=True))
+    pieces = list(zip(_pieces(root, br), _pieces(tip, bt), strict=True))
+    total = max(_length(root + root[:1]), _length(tip + tip[:1]))
     for pr, pt in pieces:
+        longest = max(_length(pr), _length(pt))
         if len(pieces) > 1 and _straight(pr) and _straight(pt):
             n = 1  # a straight side is one move: short pieces at corners upset the kerf (§10.7)
         else:
-            n = max(1, math.ceil(max(_length(pr), _length(pt)) / max(max_segment, 1e-3)))
-        if len(pieces) == 1:
-            n = max(n, MIN_CIRCLE_POINTS)
+            n = max(1, math.ceil(longest / max(max_segment, 1e-3)))
+        if smooth:  # a circle keeps at least MIN_CIRCLE_POINTS points, however it is cut into pieces
+            n = max(n, math.ceil(MIN_CIRCLE_POINTS * longest / total - 1e-9))
         out_r += _resample(pr, n)[:-1]
         out_t += _resample(pt, n)[:-1]
     return tuple(out_r), tuple(out_t)
+
+
+def _around(loop: list[Point], p: Point, name: str) -> list[Point]:
+    """Two points on the closed loop SLIT_EDGE_MM before and after the point nearest to `p`."""
+    closed = loop + loop[:1]
+    total = _length(closed)
+    best, at, run = math.inf, 0.0, 0.0
+    for a, b in itertools.pairwise(closed):
+        seg = math.dist(a, b)
+        q, f = _foot(p, a, b)
+        if math.dist(p, q) < best:
+            best, at = math.dist(p, q), run + f * seg
+        run += seg
+    half = min(SLIT_EDGE_MM, total / 20)
+    if not half < at < total - half:
+        raise DxfError(f"{name}: a channel runs into this hole too close to where its own channel starts")
+    return [_at_length(closed, at - half), _at_length(closed, at + half)]
+
+
+def _foot(p: Point, a: Point, b: Point) -> tuple[Point, float]:
+    """The point of segment a-b nearest to p, and its fraction along the segment."""
+    seg = math.dist(a, b)
+    if seg == 0:
+        return a, 0.0
+    f = max(0.0, min(1.0, ((p[0] - a[0]) * (b[0] - a[0]) + (p[1] - a[1]) * (b[1] - a[1])) / seg**2))
+    return (a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])), f
+
+
+def _at_length(line: list[Point], s: float) -> Point:
+    for k, (a, b) in enumerate(itertools.pairwise(line)):
+        seg = math.dist(a, b)
+        if s <= seg or k == len(line) - 2:
+            f = 0.0 if seg == 0 else min(1.0, s / seg)
+            return a[0] + f * (b[0] - a[0]), a[1] + f * (b[1] - a[1])
+        s -= seg
+    return line[-1]
+
+
+def _with_points(loop: list[Point], points: list[Point]) -> tuple[list[Point], list[int]]:
+    """The loop with `points` (each on one of its edges) inserted, and their indices."""
+    closed = loop + loop[:1]
+    placed: list[tuple[int, float, Point]] = []
+    for p in points:
+        edge = min(range(len(loop)), key=lambda i: math.dist(p, _foot(p, closed[i], closed[i + 1])[0]))
+        placed.append((edge, math.dist(closed[edge], p), p))
+    out: list[Point] = []
+    for i in range(len(loop)):
+        out.append(loop[i])
+        for _, _, p in sorted(x for x in placed if x[0] == i):
+            if math.dist(p, out[-1]) > 1e-9 and math.dist(p, closed[i + 1]) > 1e-9:
+                out.append(p)
+    index = [min(range(len(out)), key=lambda k: math.dist(out[k], p)) for p in points]
+    return out, index

@@ -113,7 +113,7 @@ class PreviewGeometry:
     tip_y: float
     times: list[float]  # minutes from the entry point to each path point
     letters: tuple[str, str, str, str]  # G-code letters of axes 1 to 4
-    phases: list[str]  # per path point: "entry", then the move kind: "lead_in", "cut" or "exit"
+    phases: list[str]  # per path point: "entry", then the move kind: "lead_in", "cut", "channel_exit", "rapid", "exit"
     safe_position: tuple[float, float, float, float]  # axes 1 to 4
     root_holes: tuple[list[Point], ...] = ()  # inner contours (features), placed, at the root face
     tip_holes: tuple[list[Point], ...] = ()
@@ -131,13 +131,15 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
         targets.append([outline.place(p) for p in outline.contour])
         holes.append(tuple([outline.place(p) for p in f.points] for f in section.features if f.kind == "hole"))
 
-    # the wire path from the entry point (end of the last rapid before the cut) to the exit
+    # the wire path from the entry point (end of the last rapid before the cut) to the exit,
+    # with the rapid channel exits inside the cut (§10.4): the machine runs them too
     first = next(i for i, m in enumerate(result.moves) if m.kind != "rapid")
-    feed_moves = [m for m in result.moves if m.kind != "rapid"]
+    last = max(i for i, m in enumerate(result.moves) if m.kind != "rapid")
+    feed_moves = result.moves[first : last + 1]
     feeds = [result.moves[first - 1].axes] + [m.axes for m in feed_moves]
     times = [0.0]
-    for m in feed_moves:
-        times.append(times[-1] + m.duration)
+    for k, m in enumerate(feed_moves):
+        times.append(times[-1] + (m.duration if m.kind != "rapid" else _rapid_minutes(feeds[k], m.axes, profile)))
 
     def at_plane(y: float) -> list[Point]:
         s = y / profile.wire_span
@@ -146,7 +148,7 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
     a = profile.axes
     b = job.block
     return PreviewGeometry(
-        stock=(b.x, profile.table_z, b.x + b.length, profile.table_z + b.height),
+        stock=(b.x, b.bottom(profile.table_z), b.x + b.length, b.bottom(profile.table_z) + b.height),
         travel=(max(a[0].min, a[2].min), max(a[1].min, a[3].min), min(a[0].max, a[2].max), min(a[1].max, a[3].max)),
         root_target=targets[0],
         tip_target=targets[1],
@@ -166,6 +168,11 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
     )
 
 
+def _rapid_minutes(start: tuple[float, ...], end: tuple[float, ...], profile: Profile) -> float:
+    """Shortest time of a rapid move: the slowest axis at its max_rate (no acceleration)."""
+    return max(abs(b - a) / axis.max_rate for a, b, axis in zip(start, end, profile.axes, strict=True))
+
+
 @dataclass(frozen=True)
 class AlignEdge:
     """A long stock edge (parallel to the wire) and how to put the wire on it."""
@@ -174,6 +181,24 @@ class AlignEdge:
     x: float  # axes 1 and 3
     z: float  # axes 2 and 4
     gcode: tuple[str, str, str]  # lift, across, down: no diagonal rapid
+    corner: str = ""  # key in CORNERS
+
+
+# the stock's long edges (corners in the section view): key -> (label, at high x, at the top).
+# The back face is the smallest x (job-file.md §5); the wire enters from the front.
+CORNERS = {
+    "back_top": ("back top (low x)", False, True),
+    "front_top": ("front top (high x)", True, True),
+    "back_bottom": ("back bottom (low x)", False, False),
+    "front_bottom": ("front bottom (high x)", True, False),
+}
+
+
+def block_at_corner(corner: str, wire: Point, length: float, height: float) -> tuple[float, float]:
+    """(block x, block z) of a stock `length` x `height` whose `corner` (CORNERS) is at the
+    wire's (x, z): the back face x and the bottom face z for the job (job-file.md §5)."""
+    _, front, top = CORNERS[corner]
+    return wire[0] - (length if front else 0.0), wire[1] - (height if top else 0.0)
 
 
 def alignment_edges(g: PreviewGeometry) -> list[AlignEdge]:
@@ -184,16 +209,16 @@ def alignment_edges(g: PreviewGeometry) -> list[AlignEdge]:
     l1, l2, l3, l4 = g.letters
     safe = g.safe_position
     edges = []
-    for name, x, z in (
-        ("low-x top edge", x0, z1),
-        ("high-x top edge", x1, z1),
-        ("low-x bottom edge (on the table)", x0, z0),
-        ("high-x bottom edge (on the table)", x1, z0),
+    for corner, name, x, z in (
+        ("back_top", "low-x top edge", x0, z1),
+        ("front_top", "high-x top edge", x1, z1),
+        ("back_bottom", "low-x bottom edge", x0, z0),
+        ("front_bottom", "high-x bottom edge", x1, z0),
     ):
         gcode = (
             f"G90 G0 {l2}{safe[1]:.3f} {l4}{safe[3]:.3f}",
             f"G0 {l1}{x:.3f} {l3}{x:.3f}",
             f"G0 {l2}{z:.3f} {l4}{z:.3f}",
         )
-        edges.append(AlignEdge(name, x, z, gcode))
+        edges.append(AlignEdge(name, x, z, gcode, corner))
     return edges

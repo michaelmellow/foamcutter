@@ -30,6 +30,7 @@ Vec = tuple[float, float, float]
 
 PARALLEL_COS = 0.9999  # faces within about 0.8 degrees count as parallel
 CURVE_STEP = 0.2  # mm between sampled points on curved edges, before simplifying
+WIRE_POINTS = 60  # points per curved edge in the model's wireframe (the face picker's view)
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class StepModel:
     path: Path
     faces: tuple[StepFace, ...]  # flat faces only, largest first
     bbox: tuple[Vec, Vec]
+    wire: tuple[tuple[Vec, ...], ...] = ()  # every edge of the model, coarsely sampled, for drawing
 
     def face(self, tag: int) -> StepFace:
         for f in self.faces:
@@ -126,6 +128,7 @@ def _read_cached(name: str, _mtime: int, _size: int) -> StepModel:
             if gmsh.model.getType(2, tag) != "Plane":
                 continue
             faces.append(_face(gmsh, tag))
+        wire = tuple(_curve(gmsh, tag, WIRE_POINTS) for _, tag in gmsh.model.getEntities(1))
     finally:
         gmsh.finalize()
     if not faces:
@@ -134,7 +137,16 @@ def _read_cached(name: str, _mtime: int, _size: int) -> StepModel:
             "close them in CAD, or export the two sections as DXFs."
         )
     faces.sort(key=lambda f: f.area, reverse=True)
-    return StepModel(path, tuple(faces), ((lo[0], lo[1], lo[2]), (hi[0], hi[1], hi[2])))
+    return StepModel(path, tuple(faces), ((lo[0], lo[1], lo[2]), (hi[0], hi[1], hi[2])), wire)
+
+
+def _curve(gmsh: object, tag: int, n: int) -> tuple[Vec, ...]:
+    """One edge of the model as n + 1 points (2 for a straight line)."""
+    model = gmsh.model  # type: ignore[attr-defined]
+    t0, t1 = (float(v[0]) for v in model.getParametrizationBounds(1, tag))
+    n = 1 if model.getType(1, tag) == "Line" else n
+    xyz = model.getValue(1, tag, [t0 + (t1 - t0) * i / n for i in range(n + 1)])
+    return tuple((float(xyz[3 * i]), float(xyz[3 * i + 1]), float(xyz[3 * i + 2])) for i in range(n + 1))
 
 
 def _face(gmsh: object, tag: int) -> StepFace:

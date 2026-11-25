@@ -119,17 +119,21 @@ block: { x: 100.0, length: 300.0, height: 60.0 }
 | `x` | number, mm | yes | Work-frame `x` of the block's back face (its smallest `x`). |
 | `length` | number, mm | yes | Block size along `x`. > 0. |
 | `height` | number, mm | yes | Block size along `z`. > 0. |
+| `z` | number, mm | no | Work-frame `z` of the block's bottom face. Default: `table_z`. |
 
 The block is a rectangular box occupying
 
 ```text
 x from block.x            to block.x + block.length
 y from min(root.y, tip.y) to max(root.y, tip.y)
-z from table_z            to table_z + block.height
+z from z0                 to z0 + block.height
 ```
 
-where `table_z` is the G54 `z` of the table top, from the machine profile
-(machine profile §3.4). The block rests on the table.
+where `z0` is `block.z` if given, else `table_z`, the G54 `z` of the table top
+from the machine profile (machine profile §3.4). Without `z` the block rests on
+the table. With `z` the block may be a part of a larger block, for example the
+next layer of a stack of parts cut from one block; the CAM then knows only this
+part, not the foam around it (§10.6).
 **The block's two end faces
 are the two section planes.** These two faces are the **foam faces**. Wire speeds
 "at the foam" always mean speeds at these two planes. (If the real block is
@@ -329,6 +333,20 @@ first point. Channel points go through §6.4 and §6.5 like feature points. Like
 a straight slit, a channel is cut but is not part of the target geometry. A
 straight slit in any direction is a channel of one point.
 
+**Channels into another hole.** A channel may instead end inside another
+feature of `kind: "hole"`, its **parent**: every channel point except the last
+lies strictly inside the outer contour and outside every hole, and the last
+lies strictly inside the parent. Only the last segment crosses the parent's
+edges; the slit point is the first point where it does, and it must lie on
+the same edge of the parent (the same pair of neighbouring points) at root and
+tip. The channel must not cross the outer contour, any other feature, or
+itself, and must not cross its own feature's edges except at its first point.
+`slit` is not checked for such a channel. The parent must have the same name
+at root and tip, and following parents from feature to feature must end at a
+feature whose slit meets the outer contour; a loop of features that only lead
+into each other is invalid. A hole may be the parent of several features. The
+slit point is inserted into the parent's points as an extra vertex.
+
 **Order.** Along the cutting direction (§10.1) the slit points of root and tip
 must occur in the same order of feature names. If not, the job is invalid.
 
@@ -360,7 +378,8 @@ The start point is called `S`.
 
 These points are matched one to one between root and tip: `S`, the leading
 edge, the far trailing-edge point, the slit points, every vertex of every
-feature, and every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
+feature (with the slit points of channels into another hole inserted, §8), and
+every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
 vertices. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
 the placed contours of §6.5, in each section plane. Twist and placement are a
 rotation and a translation, so lengths and angles are the same in both frames.
@@ -414,6 +433,9 @@ Feature vertices are not resampled.
    move for a straight slit; for a channel, one move per channel segment,
    through the channel points in reverse order), then
    - hole: around the feature through all vertices and back to its first point;
+     on reaching the slit point of a feature whose channel ends in this hole
+     (§8), that feature is cut the same way (into it along its channel, around
+     it, and out again to the slit point) before going on around this hole;
    - open: along the vertices to the last one, then back through them in reverse
      to the first;
    then back along the slit the same way to the slit point (the **channel
@@ -456,8 +478,9 @@ given in the text report instead.
 The program starts with a rapid move to `safe_position`, then a rapid move to
 the entry points. It ends with a rapid move from the entry points back to
 `safe_position`. The CAM rejects the job if either rapid move would pass
-through the block (§5, from `z = table_z`) at any plane between the two foam
-faces.
+through the block (§5, from `z = z0`) at any plane between the two foam
+faces. Foam outside the block (§5) is not checked: when the block is part of a larger
+block, the operator must make sure the rapid moves and the lead-in are clear of it.
 
 Before running the program the operator must make sure the wire can travel in
 a straight line from where it is to `safe_position` without touching foam.
@@ -510,7 +533,8 @@ a straight line from where it is to `safe_position` without touching foam.
    its own.
 7. Slits, lead-ins, exits and `open` features are not offset. A slit runs
    straight from the offset slit point to the offset first vertex of its
-   feature.
+   feature. For a channel into another hole the slit point is the parent's
+   offset inserted vertex.
 8. If a vertex moves by more than 4 × the larger half kerf of its two edges,
    the CAM stops with an error naming the section and the point, rather than
    cutting a spike.

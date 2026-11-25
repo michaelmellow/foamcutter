@@ -16,6 +16,7 @@ RECTANGLE = [[1.0, 0.1], [0.0, 0.1], [0.0, -0.1], [1.0, -0.1]]  # 100 x 20 mm, u
 HOLE = [[40.0, -6.0], [40.0, -14.0], [50.0, -14.0], [50.0, -6.0]]
 OTHER = [[70.0, -6.0], [70.0, -14.0], [80.0, -14.0], [80.0, -6.0]]
 CURVED = [[38.0, -4.0], [37.0, -2.0], [37.0, 5.0]]
+INTO_SPAR = [[55.0, -10.0], [45.0, -10.0]]  # "other" reached through the spar (job file section 8)
 
 
 def profile() -> dict[str, Any]:
@@ -28,7 +29,8 @@ def profile() -> dict[str, Any]:
     }
 
 
-def job(channel: list[list[float]] | None = None, tip_chord: float = 100.0, **top: Any) -> dict[str, Any]:
+def job(channel: list[list[float]] | None = None, tip_chord: float = 100.0,
+        other_channel: list[list[float]] | None = None, **top: Any) -> dict[str, Any]:
     def section(y: float, chord: float) -> dict[str, Any]:
         scale = chord / 100.0
         hole: dict[str, Any] = {"name": "spar", "kind": "hole", "slit": "upper",
@@ -37,6 +39,8 @@ def job(channel: list[list[float]] | None = None, tip_chord: float = 100.0, **to
             hole["channel"] = [[u * scale, v * scale] for u, v in channel]
         other = {"name": "other", "kind": "hole", "slit": "upper",
                  "points": [[u * scale, v * scale] for u, v in OTHER]}
+        if other_channel is not None:
+            other["channel"] = [[u * scale, v * scale] for u, v in other_channel]
         return {"shape": {"points": RECTANGLE}, "chord": chord, "twist": 0.0, "twist_axis": 0.0,
                 "position": {"x": 100.0, "y": y, "z": 50.0}, "features": [hole, other]}
 
@@ -76,6 +80,8 @@ def sim(gcode: str, data: dict[str, Any]) -> Any:
         {"channel": CURVED, "channel_exit": "rapid"},
         {"channel": [[30.0, 5.0]], "channel_exit": 400.0},
         {"channel": CURVED, "channel_exit": "rapid", "tip_chord": 80.0},
+        {"other_channel": INTO_SPAR},
+        {"other_channel": INTO_SPAR, "channel": CURVED, "channel_exit": "rapid", "tip_chord": 80.0},
     ],
 )
 def test_channel_programs_pass(case: dict[str, Any]) -> None:
@@ -110,3 +116,24 @@ def test_bad_channel_is_rejected() -> None:
     data = job(channel=[[60.0, -3.0], [75.0, -10.0], [85.0, 5.0]])  # through "other"
     with pytest.raises(InputError, match='crosses the feature "other"'):
         sim("G0 X0 Y0 Z0 A0\n", data)
+
+
+def test_channels_leading_into_each_other_are_rejected() -> None:
+    from foamsim import InputError
+
+    data = job(channel=[[60.0, -3.0], [75.0, -8.0]], other_channel=INTO_SPAR)
+    with pytest.raises(InputError, match="never leads to the outer contour"):
+        sim("G0 X0 Y0 Z0 A0" + chr(10), data)
+
+
+def test_raised_block_is_simulated() -> None:
+    """job-file.md §5 block.z: the block may sit above the table (here on another one)."""
+    from foamsim import InputError
+
+    data = job(block={"x": 90.0, "length": 120.0, "height": 40.0, "z": 30.0})
+    assert parse_job(copy.deepcopy(data), Path(".")).block.z == 30.0
+    result = sim(cam(data), data)
+    assert result.passed, result.summary()
+    low = job(block={"x": 90.0, "length": 120.0, "height": 40.0, "z": 45.0})  # part reaches z = 40
+    with pytest.raises(InputError, match="lies outside the block"):
+        sim("G0 X0 Y0 Z0 A0\n", low)

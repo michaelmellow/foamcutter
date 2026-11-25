@@ -284,3 +284,41 @@ def test_window_step_workflow(
         assert window.geometry is not None
     finally:
         wing.with_name("moved.step").rename(wing)
+
+
+def test_face_loops_close(wing: Path) -> None:
+    from foamdxf.facepick import face_loops
+
+    model = read_step(wing)
+    assert model.wire  # the model's edges, for drawing
+    for face in model.faces:
+        loops = face_loops(face)
+        assert loops and all(math.dist(lp[0], lp[-1]) < 0.01 for lp in loops)  # each loop closes
+
+
+def test_window_picks_faces_on_the_model(window: SlicerWindow, wing: Path) -> None:
+    window.vars["source"].set("step")
+    window._source_changed()
+    window.vars["step"].set(str(wing))
+    window._load_step()
+    pair = read_step(wing).suggest()
+    assert pair is not None
+    picker = window._pick_faces()
+    assert picker is not None
+    picker.window.update()
+    picker.draw()
+    assert picker.picked == {"root": pair[0], "tip": pair[1]}  # starts from the form's faces
+
+    # click the tip cap as the root, then the root cap as the tip: the faces swap
+    picker.mode.set("root")
+    for tag in (pair[1], pair[0]):
+        x, y = picker.project(read_step(wing).face(tag).centre)
+        hit = picker.face_at(x, y)
+        assert hit is not None
+        picker.click(x, y)
+    assert picker.picked == {"root": pair[1], "tip": pair[0]}
+    assert "Span 270.000 mm" in picker.info.get()
+    picker.accept()
+    assert (window.vars["root_face"].get(), window.vars["tip_face"].get()) == (str(pair[1]), str(pair[0]))
+    assert window.face_text["root_face"].get().startswith(f"face {pair[1]}:")
+    assert window.vars["span"].get() == "270"

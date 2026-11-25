@@ -8,6 +8,7 @@ file in one .foamproj file (see project.py). Uses Tkinter only (part of Python),
 packages. The last values are remembered in ~/.foamdxf-gui.json.
 """
 
+import argparse
 import functools
 import json
 import math
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tkinter as tk
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -26,10 +27,13 @@ from foamcam.errors import FoamcamError
 from foamcam.geometry import inside
 from foamcam.profile import Profile, load_profile
 
+from .crosstab import CrossCutPanel
 from .errors import DxfError
+from .facepick import FacePicker
 from .holes import (
     CHANNELS,
     SHAPES,
+    ChannelPreview,
     ChannelSpec,
     HolePair,
     area_centre,
@@ -44,17 +48,21 @@ from .machine import (
     MOUSE_FEED_MIN,
     MachinePanel,
     Program,
+    load_machine_settings,
     on_wire,
+    save_machine_settings,
     tower_positions,
     tower_targets,
 )
 from .outline import Point
 from .pipeline import (
+    CORNERS,
     AlignEdge,
     Plan,
     PreviewGeometry,
     Request,
     alignment_edges,
+    block_at_corner,
     make_job,
     outline_size,
     preview_geometry,
@@ -67,6 +75,14 @@ from .project import open_project as read_project
 from .project import save_project as write_project
 from .sender import Status
 from .step import StepModel, read_step, sections
+from .uiscale import (
+    UI_SIZE_KEY,
+    UI_SIZES,
+    ScrollArea,
+    apply_ui_size,
+    fit_to_screen,
+    parse_ui_size,
+)
 from .view3d import View3D
 
 REPO = Path(__file__).resolve().parents[2]
@@ -89,13 +105,17 @@ MARGINS = {"stock_length": "margin_length", "stock_height": "margin_height"}  # 
 CUT_FIELDS = [
     ("speed", "Cut speed", "150", "mm/min"),
     ("lead_in", "Lead-in", "20", "mm"),
-    ("block_x", "Stock back face x", "", "mm, blank = centred"),
     ("safe_clearance", "Safe height above stock", "20", "mm"),
     ("min_te", "Min trailing edge", "0.6", "mm, 0 = as drawn"),
     ("segment", "Max segment length", "1", "mm"),
     ("simplify", "Simplify tolerance", "0.01", "mm, 0 = keep all"),
 ]
-DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
+# where the stock is: shown in the 3D tab's stock panel, set by hand or from the wire position
+STOCK_FIELDS = [
+    ("block_x", "Back face x", "", "mm, blank = centred"),
+    ("block_z", "Bottom face z", "", "mm, blank = on the table"),
+]
+DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS + STOCK_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
 DEFAULTS |= {"channel": "shortest"}  # side the wire enters inner contours (holes) from
 # how the wire leaves a hole's channel ("rapid", "cut" or mm/min), and the drawn channels (JSON, holes.py)
@@ -116,6 +136,13 @@ COLOURS = {
     "tower_34": "#e8710a",
     "target": "#202124",
 }
+
+
+VIEW3D_SHARE = 0.4  # the 3D view's first share of the Machine tab's width
+RIGHT_PANE_MIN = 560  # px the tabs keep beside the form before the window scrolls sideways
+STOCK_NOTE_WIDTH = 420  # wrap of the Stock tab's notes, px
+STRAIGHT_WIRE_MM = 0.05  # towers closer than this: the wire runs along a stock edge
+TABLE_TOLERANCE_MM = 0.01  # a stock bottom this far below the table is still on it
 
 
 class FormError(ValueError):
@@ -148,6 +175,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         return n
 
     labels = {key: label for key, label, _, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS} | STEP_LABELS
+    labels |= {key: f"Stock {label[0].lower()}{label[1:]}" for key, label, _, _ in STOCK_FIELDS}
     step = values.get("source", "dxf") == "step"
     keys = ("step", "profile") if step else ("root", "tip", "profile")
     paths = {key: Path(text(key, labels[key])) for key in keys}
@@ -171,6 +199,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         block_x=number("block_x", labels["block_x"], optional=True),
         lead_in=req("lead_in", labels["lead_in"]),
         safe_clearance=req("safe_clearance", labels["safe_clearance"]),
+        block_z=number("block_z", labels["block_z"], optional=True),
     )
     exit_text = values.get("channel_exit", "rapid").strip().lower() or "rapid"
     channel_exit: str | float = exit_text
@@ -212,12 +241,27 @@ ZOOM_STEP = 1.2  # per wheel notch
 ZOOM_RANGE = (0.2, 50.0)
 DRAG_PIXELS = 4  # a left press that moves further than this is a drag, not a click
 HANDLE_PIXELS = 9  # a press this close to a channel handle grabs it
-CHANNEL_PREVIEW_MS = 400  # after a channel edit, wait this long before running the CAM again
+CHANNEL_PANE_WIDTH = 300  # pixels
+
+
+@dataclass
+class ChannelRow:
+    """One hole's block in the channel pane."""
+
+    block: tk.LabelFrame
+    vars: dict[str, tk.StringVar]  # shape, angle, offset, entry, radius
+    spins: dict[str, ttk.Spinbox]
+    note: tk.StringVar  # where the channel ends, or why it cannot be cut
 
 
 def _legend_slot(i: int) -> tuple[float, float]:
     """Canvas x, y of legend line i (0-7)."""
     return 12 + 290 * (i // 4), 12 + 16 * (i % 4)
+
+
+def _fixed(value: float) -> str:
+    """A position for a form field: 3 decimals, no trailing zeros."""
+    return f"{value:.3f}".rstrip("0").rstrip(".") if abs(value) >= 5e-4 else "0"
 
 
 def _number(text: str) -> float | None:
@@ -248,8 +292,7 @@ class SlicerWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("Foam cutter: DXF slicer")
-        root.geometry("1200x760")
-        root.minsize(900, 560)
+        fit_to_screen(root, 1200, 760)
         self.vars: dict[str, tk.StringVar] = {k: tk.StringVar(value=v) for k, v in load_settings().items()}
         self.plan: Plan | None = None
         self.result: CamResult | None = None
@@ -268,7 +311,6 @@ class SlicerWindow:
         self.move_target: tuple[float, float, tuple[int, ...]] | None = None  # x, z, towers last asked for
         self.channel_handles: dict[tuple[str, str], tuple[float, float]] = {}  # (hole, "entry"/"angle"): canvas
         self._channel_drag: tuple[str, str] | None = None
-        self._channel_after: str | None = None
         self.saved_values: dict[str, str] = {}
         self.step_model: StepModel | None = None
         self._step_pending = False
@@ -279,7 +321,10 @@ class SlicerWindow:
         self.status = tk.StringVar(value="Pick the two DXFs, then press Preview.")
         ttk.Label(root, textvariable=self.status, anchor="w", padding=(8, 3), relief="sunken").pack(
             side=tk.BOTTOM, fill=tk.X)
-        paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+        # the whole window scrolls when it is smaller than the form (high display scaling)
+        self.scroll = ScrollArea(root, lambda: (form.winfo_reqwidth() + RIGHT_PANE_MIN, paned.winfo_reqheight()))
+        self.scroll.pack(fill=tk.BOTH, expand=True)
+        paned = ttk.PanedWindow(self.scroll.body, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
         form = ttk.Frame(paned, padding=8)
         right = ttk.Frame(paned)
@@ -288,6 +333,7 @@ class SlicerWindow:
 
         self._build_menu()
         self._build_form(form)
+        self.scroll.wheel_scrolls(form)
         self._build_right(right)
         self.vars["profile"].trace_add("write", lambda *_: self._load_kerf_tables())
         self._load_kerf_tables()
@@ -320,11 +366,25 @@ class SlicerWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.close)
         menubar.add_cascade(label="File", menu=file_menu)
+        view_menu = tk.Menu(menubar, tearoff=False)
+        size_menu = tk.Menu(view_menu, tearoff=False)
+        self.ui_size = tk.DoubleVar(value=parse_ui_size(load_machine_settings().get(UI_SIZE_KEY, 1.0)))
+        for size in UI_SIZES:
+            size_menu.add_radiobutton(label=f"{size:.0%}", value=size, variable=self.ui_size,
+                                      command=self._ui_size_chosen)
+        view_menu.add_cascade(label="UI size", menu=size_menu)
+        menubar.add_cascade(label="View", menu=view_menu)
         self.root.configure(menu=menubar)
         self.root.bind_all("<Control-n>", lambda _e: self.new_project())
         self.root.bind_all("<Control-o>", lambda _e: self.open_project())
         self.root.bind_all("<Control-s>", lambda _e: self.save_project())
         self.root.bind_all("<Control-S>", lambda _e: self.save_project_as())
+
+    def _ui_size_chosen(self) -> None:
+        self.machine.settings[UI_SIZE_KEY] = self.ui_size.get()
+        save_machine_settings(self.machine.settings)
+        messagebox.showinfo("UI size", f"The UI opens at {self.ui_size.get():.0%} from the next start.",
+                            parent=self.root)
 
     def modified(self) -> bool:
         return self.values() != self.saved_values
@@ -460,6 +520,10 @@ class SlicerWindow:
                     row += 1
                     self.face_text[face_key], self.face_boxes[face_key] = text_var, box
                     self.mode_rows["step"] += [name, box]
+                self.pick_button = ttk.Button(files, text="Pick faces on the model…", command=self._pick_faces)
+                self.pick_button.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+                row += 1
+                self.mode_rows["step"].append(self.pick_button)
                 self.span_note = ttk.Label(files, text="", foreground="#5f6368", wraplength=330, justify="left")
                 self.span_note.grid(row=row, column=0, columnspan=3, sticky="w")
                 row += 1
@@ -636,6 +700,29 @@ class SlicerWindow:
             self.face_text[key].set(model.face(int(self.vars[key].get())).label())
         self._measure_span()
 
+    def _pick_faces(self) -> FacePicker | None:
+        """Open the 3D face picker on the loaded model (step.py, facepick.py)."""
+        if self.step_model is None:
+            self._load_step()
+        if self.step_model is None:
+            self.status.set("Pick faces: choose a STEP model first.")
+            return None
+
+        def chosen(text: str) -> int | None:
+            return int(text) if text.strip().isdigit() else None
+
+        def done(root: int, tip: int) -> None:
+            model = self.step_model
+            if model is None:
+                return
+            for key, tag in (("root_face", root), ("tip_face", tip)):
+                self.vars[key].set(str(tag))
+                self.face_text[key].set(model.face(tag).label())
+            self._measure_span()
+
+        return FacePicker(self.root, self.step_model, chosen(self.vars["root_face"].get()),
+                          chosen(self.vars["tip_face"].get()), done)
+
     def _face_picked(self, key: str, _event: object = None) -> None:
         found = re.match(r"face (\d+):", self.face_text[key].get())
         if found:
@@ -663,32 +750,42 @@ class SlicerWindow:
         tabs = ttk.Notebook(right)
         tabs.pack(fill=tk.BOTH, expand=True)
 
-        # 3D tab: orbitable view plus a wire scrubber
-        frame3d = ttk.Frame(tabs)
-        self.canvas3d = tk.Canvas(frame3d, background="white", highlightthickness=0)
+        # Machine tab: the 3D view as a full-height pane on the left (with a wire scrubber),
+        # the machine panel on the right; the stock panel is a tab beside Program, Jog and Home
+        self.machine_tab = ttk.PanedWindow(tabs, orient=tk.HORIZONTAL)
+        tabs.add(self.machine_tab, text="Machine")
+        frame3d = ttk.Frame(self.machine_tab)
+        self.machine = MachinePanel(self.machine_tab, self._current_program, self._letters, self.status.set,
+                                    faces=self._faces, on_status=self._live_status, travel=self._travel)
+        self.machine_tab.add(frame3d, weight=2)
+        self.machine_tab.add(self.machine, weight=3)
+        # the machine panel asks for all the width it can use: give the 3D view its share once
+        # the tab has a size (after that, the divider stays where it is dragged)
+        self._split_done = False
+        self.machine_tab.bind("<Configure>", self._split_machine_tab, add="+")
+        view_side = frame3d
+        # the scrubber and readout first, at the bottom, so a short pane shrinks only the view
+        controls = ttk.Frame(view_side, padding=(6, 4))
+        controls.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_readout(view_side)
+        self.canvas3d = tk.Canvas(view_side, background="white", highlightthickness=0)
         self.canvas3d.pack(fill=tk.BOTH, expand=True)
         self.view3d = View3D(self.canvas3d)
-        self._build_readout(frame3d)
-        controls = ttk.Frame(frame3d, padding=(6, 4))
-        controls.pack(fill=tk.X)
+        self.view3d.on_pick = self._pick_corner
         self.play_text = tk.StringVar(value="Play")
         ttk.Button(controls, textvariable=self.play_text, width=7, command=self.toggle_play).pack(side=tk.LEFT)
         self.wire_pos = tk.DoubleVar(value=0)
         self.scrubber = ttk.Scale(controls, from_=0, to=1, variable=self.wire_pos, command=self._scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         self.wire_label = tk.StringVar(value="")
-        ttk.Label(controls, textvariable=self.wire_label, width=30).pack(side=tk.LEFT)
-        ttk.Button(controls, text="Reset view", command=self.view3d.reset).pack(side=tk.LEFT)
+        ttk.Label(controls, textvariable=self.wire_label, width=22).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Reset view", command=lambda: self.view3d.reset()).pack(side=tk.LEFT)
         self.playing = False
-        tabs.add(frame3d, text="3D")
-
-        self.align_frame = ttk.Frame(tabs, padding=12)
-        tabs.add(self.align_frame, text="Align stock")
+        self.stock_pane = ttk.Frame(self.machine.controls, padding=8)
+        self.stock_corner = tk.StringVar(value="front_top")  # not a form value: picking one keeps the preview
+        self.stock_wire_text = tk.StringVar(value="")
         self._update_alignment()
 
-        self.machine = MachinePanel(tabs, self._current_program, self._letters, self.status.set,
-                                    faces=self._faces, on_status=self._live_status, travel=self._travel)
-        tabs.add(self.machine, text="Machine")
         # the section view lives in the Machine tab, beside the console, to watch the live position
         self.section_frame = ttk.Frame(self.machine.views)
         bar = ttk.Frame(self.section_frame, padding=(4, 2))
@@ -708,17 +805,22 @@ class SlicerWindow:
         self.speed_text = tk.StringVar()
         ttk.Label(bar, textvariable=self.speed_text, width=26).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(bar, text="Fit view", command=self.fit_view).pack(side=tk.LEFT, padx=8)
-        self._build_channel_bar()
         ttk.Label(self.section_frame, foreground="#5f6368", padding=(4, 0), text=(
             "wheel zoom · right-drag pan · click: both towers · X or Z + click: that tower · drag: towers follow"
             )).pack(anchor="w")
         self._show_speed()
-        self.canvas = tk.Canvas(self.section_frame, background="white", highlightthickness=0)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        body = ttk.Frame(self.section_frame)
+        body.pack(fill=tk.BOTH, expand=True)
+        self._build_channel_pane(body)
+        self.canvas = tk.Canvas(body, background="white", highlightthickness=0)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.kerf = KerfPanel(self.machine.controls, self.machine, profile=self._profile,
                               profile_path=lambda: Path(self.vars["profile"].get().strip()),
                               target=lambda: self.vars["speed"].get(), saved=self._kerf_saved)
         self.machine.controls.add(self.kerf, text="Kerf")
+        self.machine.controls.add(self.stock_pane, text="Stock")
+        self.cross_cut = CrossCutPanel(self.machine.controls, self.machine, profile=self._profile)
+        self.machine.controls.add(self.cross_cut, text="Cut")
         self.machine.views.insert(0, self.section_frame, text="Section")
         self.machine.views.select(self.section_frame)  # type: ignore[no-untyped-call]
         report_frame = ttk.Frame(tabs)
@@ -745,41 +847,139 @@ class SlicerWindow:
         self.root.bind_all("<KeyPress>", self._key_down, add="+")
         self.root.bind_all("<KeyRelease>", self._key_up, add="+")
 
+    def _split_machine_tab(self, event: "tk.Event[ttk.PanedWindow]") -> None:
+        if self._split_done or event.width < 200:
+            return
+        self._split_done = True
+        self.machine_tab.sashpos(0, int(event.width * VIEW3D_SHARE))  # type: ignore[no-untyped-call]
+
     def _update_alignment(self) -> None:
-        """Fill the Align stock tab: where to put the wire on each long stock edge."""
-        frame = self.align_frame
+        """Fill the Stock tab (Machine tab controls): where the stock is, its corners, the live wire."""
+        frame = self.stock_pane
         for child in frame.winfo_children():
             child.destroy()
-        g = self.geometry
-        intro = (
-            "Put the wire on a stock edge, then push the stock against the wire to place and square it.\n"
-            "Both towers go to the same position, so the wire runs exactly along the edge.\n\n"
-            "Run the G-code with the wire COLD and no stock on the table: it lifts first, crosses at the\n"
-            "safe height, then goes straight down. Then slide the stock in until the edge just touches the\n"
-            "wire along its whole length. Use a top edge to set the stock's x position; the bottom edges lie\n"
-            "on the table. Positions are the wire's centre: the stock face sits half a wire diameter away."
-        )
-        ttk.Label(frame, text=intro, justify="left").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 12))
-        if g is None:
-            ttk.Label(frame, text="Press Preview first.", foreground="#5f6368").grid(row=1, column=0, sticky="w")
+        wrap = STOCK_NOTE_WIDTH
+        place = ttk.LabelFrame(frame, text="Stock position (G54)", padding=6)
+        place.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        for row, (key, label, _, unit) in enumerate(STOCK_FIELDS):
+            ttk.Label(place, text=label).grid(row=2 * row, column=0, sticky="w", pady=(2, 0))
+            ttk.Entry(place, textvariable=self.vars[key], width=10).grid(row=2 * row, column=1, sticky="w", padx=4)
+            ttk.Label(place, text=unit, foreground="#5f6368").grid(row=2 * row + 1, column=0, columnspan=2, sticky="w")
+
+        corner = ttk.LabelFrame(frame, text="Corner", padding=6)
+        corner.grid(row=0, column=1, sticky="nsw", padx=(0, 8))
+        for row, (key, (label, _, _)) in enumerate(CORNERS.items()):
+            ttk.Radiobutton(corner, text=label, value=key, variable=self.stock_corner,
+                            command=self._corner_changed).grid(row=row, column=0, sticky="w")
+        ttk.Label(corner, foreground="#5f6368", text="or click a long stock\nedge in the 3D view").grid(
+            row=4, column=0, sticky="w", pady=(2, 0))
+        self.corner_text = ttk.Label(corner, font=("Consolas", 9), justify="left")
+        self.corner_text.grid(row=0, column=1, rowspan=3, sticky="nw", padx=(12, 0))
+        buttons = ttk.Frame(corner)
+        buttons.grid(row=3, column=1, rowspan=2, sticky="sw", padx=(12, 0))
+        self.corner_buttons = [
+            ttk.Button(buttons, text="Wire to this corner", command=self._go_to_corner),
+            ttk.Button(buttons, text="Copy G-code", command=self._copy_corner),
+        ]
+        for button in self.corner_buttons:
+            button.pack(fill=tk.X, pady=1)
+
+        wire = ttk.LabelFrame(frame, text="Wire now", padding=6)
+        wire.grid(row=0, column=2, sticky="nsw", padx=(0, 8))
+        ttk.Label(wire, textvariable=self.stock_wire_text, font=("Consolas", 9), justify="left").pack(anchor="w")
+        ttk.Button(wire, text="This corner is at the wire", command=self._corner_at_wire).pack(
+            anchor="w", pady=(6, 0))
+
+        notes = ttk.Frame(frame)
+        notes.grid(row=0, column=3, sticky="nsew")
+        frame.columnconfigure(3, weight=1)
+        note = ttk.Label(notes, foreground="#5f6368", wraplength=wrap, justify="left", text=(
+            "Several parts from one block: jog the cold wire onto a corner of the foam that is left, "
+            "pick that corner and press \"This corner is at the wire\". Only this stock is checked: "
+            "cut the front (high x, where the wire enters) and the top of the block first. "
+            "Positions are the wire's centre."))
+        note.pack(anchor="w", fill=tk.X)
+        notes.bind("<Configure>", lambda e: note.configure(wraplength=max(150, e.width - 4)))
+        self._corner_changed()
+        self._show_live_wire()
+
+    def _corner_edge(self) -> AlignEdge | None:
+        """The selected corner's long edge in the last preview, or None."""
+        if self.geometry is None:
+            return None
+        key = self.stock_corner.get()
+        return next((e for e in alignment_edges(self.geometry) if e.corner == key), None)
+
+    def _corner_changed(self) -> None:
+        """Highlight the selected corner in the 3D view and show where it is."""
+        edge = self._corner_edge()
+        state = ["!disabled"] if edge is not None else ["disabled"]
+        for button in self.corner_buttons:
+            button.state(state)
+        if edge is None:
+            self.corner_text.configure(text="Press Preview to see where this corner is.")
+            self.view3d.highlight = None
+        else:
+            l1, l2, l3, l4 = self._letters()
+            self.corner_text.configure(text=f"{l1} = {l3} = {edge.x:.3f}\n{l2} = {l4} = {edge.z:.3f}")
+            self.view3d.highlight = (edge.x, edge.z, CORNERS[edge.corner][0] + " edge")
+        self.view3d.draw()
+
+    def _pick_corner(self, key: str) -> None:
+        """A long stock edge was clicked in the 3D view."""
+        self.stock_corner.set(key)
+        self._corner_changed()
+
+    def _live_towers(self) -> tuple[Point, Point] | None:
+        st = self.live
+        return None if st is None else tower_positions(st.wpos, self._letters())
+
+    def _show_live_wire(self) -> None:
+        """The live wire in the 3D view and in the stock panel."""
+        towers = self._live_towers()
+        self.view3d.set_live(towers)
+        if towers is None:
+            self.stock_wire_text.set("not connected: connect on the Machine tab")
             return
-        l1, l2, l3, l4 = g.letters
-        headers = ("Edge", f"{l1} = {l3}", f"{l2} = {l4}", "", "", "")
-        for col, text in enumerate(headers):
-            ttk.Label(frame, text=text, font=("Segoe UI", 9, "bold")).grid(row=1, column=col, sticky="w", padx=6)
-        for row, edge in enumerate(alignment_edges(g), start=2):
-            ttk.Label(frame, text=edge.name).grid(row=row, column=0, sticky="w", padx=6, pady=3)
-            ttk.Label(frame, text=f"{edge.x:.3f}", font=("Consolas", 10)).grid(row=row, column=1, sticky="e", padx=6)
-            ttk.Label(frame, text=f"{edge.z:.3f}", font=("Consolas", 10)).grid(row=row, column=2, sticky="e", padx=6)
-            ttk.Button(frame, text="Copy G-code", command=functools.partial(self._copy_edge, edge)).grid(
-                row=row, column=3, padx=4)
-            ttk.Button(frame, text="Show in 3D", command=functools.partial(self._show_edge, edge)).grid(
-                row=row, column=4, padx=4)
-            ttk.Button(frame, text="Go there", command=functools.partial(self._go_to_edge, edge)).grid(
-                row=row, column=5, padx=4)
-        self.align_text = tk.Text(frame, height=4, width=60, font=("Consolas", 10))
-        self.align_text.grid(row=7, column=0, columnspan=6, sticky="we", pady=(12, 0))
-        self.align_text.insert("1.0", "Copy G-code puts the three lines for that edge here and on the clipboard.")
+        (x1, z1), (x2, z2) = towers
+        l1, l2, l3, l4 = self._letters()
+        text = f"{l1} {x1:.3f}  {l2} {z1:.3f}\n{l3} {x2:.3f}  {l4} {z2:.3f}"
+        if math.hypot(x1 - x2, z1 - z2) > STRAIGHT_WIRE_MM:
+            text += "\nthe towers differ: not along a stock edge"
+        self.stock_wire_text.set(text)
+
+    def _corner_at_wire(self) -> None:
+        """Place the stock so the selected corner is where the wire is now, then preview."""
+        towers = self._live_towers()
+        if towers is None:
+            messagebox.showwarning("No wire position", "Connect on the Machine tab first: the wire "
+                                   "position comes from the machine.", parent=self.root)
+            return
+        (x1, z1), (x2, z2) = towers
+        if math.hypot(x1 - x2, z1 - z2) > STRAIGHT_WIRE_MM:
+            messagebox.showwarning("Wire not along the edge", (
+                f"The towers differ by {x1 - x2:+.2f} mm horizontally and {z1 - z2:+.2f} mm vertically. "
+                "Put both towers at the same position, so the wire runs along the stock edge, first."),
+                parent=self.root)
+            return
+        length, height = _number(self.vars["stock_length"].get()), _number(self.vars["stock_height"].get())
+        if length is None or height is None or length <= 0 or height <= 0:
+            messagebox.showwarning("Stock size", "Enter the stock length and height first.", parent=self.root)
+            return
+        key = self.stock_corner.get()
+        x, z = block_at_corner(key, ((x1 + x2) / 2, (z1 + z2) / 2), length, height)
+        profile = self._profile()
+        if profile is not None and z < profile.table_z - TABLE_TOLERANCE_MM:
+            messagebox.showwarning("Below the table", (
+                f"With the {CORNERS[key][0]} corner at the wire, the stock's bottom face would be at "
+                f"z = {z:.2f}, below the table (z = {profile.table_z:g}). Pick another corner or "
+                "check the stock height."), parent=self.root)
+            return
+        self.vars["block_x"].set(_fixed(x))
+        self.vars["block_z"].set(_fixed(z))
+        self.status.set(f"Stock placed with its {CORNERS[key][0]} corner at the wire: "
+                        f"back face x = {x:.3f}, bottom face z = {z:.3f}.")
+        self.preview()
 
     def _current_program(self) -> Program:
         """The G-code of the last Preview, for the Machine tab. Raises ValueError if stale."""
@@ -806,6 +1006,7 @@ class SlicerWindow:
     def _live_status(self, status: Status | None) -> None:
         self.live = status
         self._draw_live()
+        self._show_live_wire()
         self._show_speed()
 
     def _show_speed(self) -> None:
@@ -830,7 +1031,7 @@ class SlicerWindow:
             "  - the wire heat is OFF\n"
             "  - no stock on the table yet (slide it in afterwards)\n"
             "  - the work zero is the one this job was made for")):
-            self.tabs.select(self.machine)  # type: ignore[no-untyped-call]
+            self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
 
     def _profile(self) -> Profile | None:
         """The machine profile in the form (read again when the file changes), or None."""
@@ -860,36 +1061,40 @@ class SlicerWindow:
         profile = self._profile()
         return profile.letters if profile is not None else ("X", "Y", "Z", "A")
 
+    def _go_to_corner(self) -> None:
+        edge = self._corner_edge()
+        if edge is not None:
+            self._go_to_edge(edge)
+
+    def _copy_corner(self) -> None:
+        edge = self._corner_edge()
+        if edge is not None:
+            self._copy_edge(edge)
+
     def _copy_edge(self, edge: AlignEdge) -> None:
         text = "\n".join(edge.gcode)
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.align_text.delete("1.0", tk.END)
-        self.align_text.insert("1.0", f"; wire on the {edge.name}\n{text}")
-        self.status.set(f"Copied the G-code for the {edge.name}. Paste it into ioSender's MDI, wire cold.")
-
-    def _show_edge(self, edge: AlignEdge) -> None:
-        self.view3d.highlight = (edge.x, edge.z, edge.name)
-        self.view3d.draw()
-        self.tabs.select(self.frame3d)  # type: ignore[no-untyped-call]
+        self.status.set(f"Copied the G-code for the {edge.name} ({' | '.join(edge.gcode)}). "
+                        "Paste it into ioSender's MDI, wire cold.")
 
     def _build_readout(self, parent: ttk.Frame) -> None:
         """Digital readout of the wire at the slider position, like a machine DRO."""
-        dro = tk.Frame(parent, background="#202124", padx=10, pady=6)
-        dro.pack(fill=tk.X)
-        big = ("Consolas", 15, "bold")
-        small = ("Consolas", 10)
+        dro = tk.Frame(parent, background="#202124", padx=8, pady=4)
+        dro.pack(side=tk.BOTTOM, fill=tk.X)
+        big = ("Consolas", 12, "bold")  # smaller than the machine's DRO above: this is the preview
+        small = ("Consolas", 9)
         self.dro_axes: list[tuple[tk.StringVar, tk.StringVar]] = []
         for i in range(4):
             letter, value = tk.StringVar(value=" "), tk.StringVar(value="   ---.---")
             cell = tk.Frame(dro, background="#202124")
-            cell.grid(row=0, column=i, sticky="w", padx=(0, 26))
+            cell.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14))  # 2 x 2: fits a narrow pane
             tk.Label(cell, textvariable=letter, font=big, fg="#8ab4f8", bg="#202124").pack(side=tk.LEFT)
             tk.Label(cell, textvariable=value, font=big, fg="#e8eaed", bg="#202124").pack(side=tk.LEFT)
             self.dro_axes.append((letter, value))
         self.dro_detail = tk.StringVar(value="Press Preview, then scrub or play the cut.")
         tk.Label(dro, textvariable=self.dro_detail, font=small, fg="#bdc1c6", bg="#202124",
-                 justify="left", anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+                 justify="left", anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     def _update_readout(self, i: int) -> None:
         g = self.geometry
@@ -911,7 +1116,8 @@ class SlicerWindow:
             sr = math.dist(g.root_cut[i], g.root_cut[i - 1]) / dt
             st = math.dist(g.tip_cut[i], g.tip_cut[i - 1]) / dt
             speeds = f"   wire speed root {sr:5.0f}  tip {st:5.0f} mm/min"
-        phase = {"entry": "at entry point", "lead_in": "lead-in", "cut": "cutting", "exit": "exit"}[g.phases[i]]
+        phase = {"entry": "at entry point", "lead_in": "lead-in", "cut": "cutting", "exit": "exit",
+                 "channel_exit": "channel exit", "rapid": "channel exit (rapid)"}.get(g.phases[i], g.phases[i])
         self.dro_detail.set(
             f"root face  x {rx:8.3f}  z {rz:8.3f}     tip face  x {tx:8.3f}  z {tz:8.3f}\n"
             f"{phase:<15}{speeds}"
@@ -985,7 +1191,7 @@ class SlicerWindow:
         self.status.set(f"OK: cut time {self.result.total_time:.2f} min, "
                         f"{sum(m.kind != 'rapid' for m in self.result.moves)} feed moves. Press Generate to write files.")
         if self.tabs.select() == str(self.report_frame):  # type: ignore[no-untyped-call]
-            self.tabs.select(self.frame3d)  # type: ignore[no-untyped-call]
+            self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
         self.draw()
         self.view3d.show(self.geometry)
         self._update_alignment()
@@ -995,6 +1201,9 @@ class SlicerWindow:
         self.preview_values = self.values()
         self.machine.refresh()
         save_settings(self.values())
+        if self.edit_channels.get():
+            self._build_channel_rows()
+        self._update_pending()
         return True
 
     def _scrub(self, value: str) -> None:
@@ -1213,31 +1422,114 @@ class SlicerWindow:
 
     # --- section view: drawing the hole channels ---------------------------------------
 
-    def _build_channel_bar(self) -> None:
-        """The row of channel settings shown under the section toolbar while editing."""
-        bar = ttk.Frame(self.section_frame, padding=(4, 0, 4, 2))
-        self.channel_bar = bar
-        self.ch_vars = {k: tk.StringVar(value=v) for k, v in (
-            ("hole", ""), ("shape", "auto"), ("angle", "90"), ("offset", "0"), ("entry", "90"), ("radius", "5"))}
-        ttk.Label(bar, text="Hole").pack(side=tk.LEFT)
-        self.ch_hole_box = ttk.Combobox(bar, textvariable=self.ch_vars["hole"], state="readonly", width=7)
-        self.ch_hole_box.pack(side=tk.LEFT, padx=(2, 8))
-        self.ch_hole_box.bind("<<ComboboxSelected>>", lambda _e: self._load_channel_fields())
-        ttk.Label(bar, text="Shape").pack(side=tk.LEFT)
-        shape = ttk.Combobox(bar, textvariable=self.ch_vars["shape"], state="readonly", width=8, values=SHAPES)
-        shape.pack(side=tk.LEFT, padx=(2, 8))
-        shape.bind("<<ComboboxSelected>>", lambda _e: self._channel_shape_changed())
-        self.ch_spins: dict[str, ttk.Spinbox] = {}
-        for key, label, lo, hi, step in (("angle", "Angle °", -360, 360, 5), ("offset", "Offset mm", -100, 100, 0.5),
-                                         ("entry", "Entry °", -360, 360, 5), ("radius", "Bend mm", 0.5, 200, 0.5)):
-            ttk.Label(bar, text=label).pack(side=tk.LEFT)
-            spin = ttk.Spinbox(bar, textvariable=self.ch_vars[key], from_=lo, to=hi, increment=step, width=6,
-                               command=self._channel_fields_changed)
-            spin.pack(side=tk.LEFT, padx=(2, 8))
-            spin.bind("<Return>", lambda _e: self._channel_fields_changed())
-            spin.bind("<FocusOut>", lambda _e: self._channel_fields_changed())
-            self.ch_spins[key] = spin
-        ttk.Button(bar, text="Reset", command=self._reset_channel).pack(side=tk.LEFT)
+    def _build_channel_pane(self, body: ttk.Frame) -> None:
+        """The pane at the right of the section view while editing channels: one block
+        per hole with its own settings, and the Cut button under them."""
+        pane = ttk.Frame(body, padding=(6, 4), width=CHANNEL_PANE_WIDTH)
+        self.channel_pane = pane
+        ttk.Label(pane, text="Hole channels", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(pane, foreground="#5f6368", wraplength=CHANNEL_PANE_WIDTH - 20, justify="left", text=(
+            "Drag the round handle along the hole and the square one to turn the channel. A channel may "
+            "end in another hole that has its own way out. Nothing is cut until you press Cut.")).pack(
+            anchor="w", pady=(0, 4))
+        bottom = ttk.Frame(pane)
+        bottom.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
+        ttk.Button(bottom, text="Cut", command=self._cut_channels).pack(side=tk.LEFT)
+        self.ch_pending = tk.StringVar(value="")
+        ttk.Label(bottom, textvariable=self.ch_pending, foreground="#e37400", wraplength=CHANNEL_PANE_WIDTH - 70,
+                  justify="left").pack(side=tk.LEFT, padx=(8, 0))
+        # a scrolling list of hole blocks
+        holder = ttk.Frame(pane)
+        holder.pack(fill=tk.BOTH, expand=True)
+        self.ch_scroll = tk.Canvas(holder, highlightthickness=0, width=CHANNEL_PANE_WIDTH - 30)
+        bar = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=self.ch_scroll.yview)
+        self.ch_scroll.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ch_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.ch_list = ttk.Frame(self.ch_scroll)
+        window = self.ch_scroll.create_window(0, 0, anchor="nw", window=self.ch_list)
+        self.ch_list.bind("<Configure>", lambda _e: self.ch_scroll.configure(
+            scrollregion=self.ch_scroll.bbox("all")))
+        self.ch_scroll.bind("<Configure>", lambda e: self.ch_scroll.itemconfigure(window, width=e.width))
+        self.ch_selected = tk.StringVar(value="")
+        self.ch_rows: dict[str, ChannelRow] = {}
+        self.ch_found: dict[str, ChannelPreview] = {}
+
+    def _build_channel_rows(self) -> None:
+        """One block per hole of the cut on screen (rebuilt when the holes change)."""
+        names = [p.name for p in self._channel_pairs()]
+        if list(self.ch_rows) == names:
+            for name in names:
+                self._show_channel_spec(name, self._channel_specs().get(name, ChannelSpec()))
+            return
+        for child in self.ch_list.winfo_children():
+            child.destroy()
+        self.ch_rows = {}
+        if not names:
+            ttk.Label(self.ch_list, text="Press Preview first: the drawings have no holes yet.",
+                      foreground="#5f6368", wraplength=CHANNEL_PANE_WIDTH - 40).pack(anchor="w")
+        for name in names:
+            self.ch_rows[name] = self._channel_row(name)
+            self._show_channel_spec(name, self._channel_specs().get(name, ChannelSpec()))
+        if self.ch_selected.get() not in names:
+            self.ch_selected.set(names[0] if names else "")
+        self._mark_selected()
+
+    def _channel_row(self, name: str) -> "ChannelRow":
+        block = tk.LabelFrame(self.ch_list, text=name, padx=6, pady=4, font=("Segoe UI", 9, "bold"))
+        block.pack(fill=tk.X, pady=(0, 6), padx=(0, 4))
+        block.bind("<Button-1>", lambda _e: self._select_hole(name))
+        row = ChannelRow(block, {k: tk.StringVar(value=v) for k, v in (
+            ("shape", "auto"), ("angle", "90"), ("offset", "0"), ("entry", "90"), ("radius", "5"))}, {},
+            tk.StringVar(value=""))
+        shapes = ttk.Frame(block)
+        shapes.grid(row=0, column=0, columnspan=4, sticky="w")
+        for shape in SHAPES:
+            ttk.Radiobutton(shapes, text=shape.capitalize(), value=shape, variable=row.vars["shape"],
+                            command=lambda: self._channel_shape_changed(name)).pack(side=tk.LEFT, padx=(0, 8))
+        for k, (key, label, lo, hi, step) in enumerate((
+                ("angle", "Angle °", -360, 360, 5), ("offset", "Offset mm", -100, 100, 0.5),
+                ("entry", "Entry °", -360, 360, 5), ("radius", "Bend mm", 0.5, 200, 0.5))):
+            ttk.Label(block, text=label).grid(row=1 + k // 2, column=2 * (k % 2), sticky="w", pady=1)
+            spin = ttk.Spinbox(block, textvariable=row.vars[key], from_=lo, to=hi, increment=step, width=6,
+                               command=lambda: self._channel_fields_changed(name))
+            spin.grid(row=1 + k // 2, column=2 * (k % 2) + 1, sticky="w", padx=(2, 8), pady=1)
+            spin.bind("<Return>", lambda _e: self._channel_fields_changed(name))
+            spin.bind("<FocusOut>", lambda _e: self._channel_fields_changed(name))
+            spin.bind("<FocusIn>", lambda _e: self._select_hole(name))
+            row.spins[key] = spin
+        ttk.Label(block, textvariable=row.note, foreground="#5f6368", wraplength=CHANNEL_PANE_WIDTH - 60,
+                  justify="left").grid(row=3, column=0, columnspan=3, sticky="w")
+        ttk.Button(block, text="Reset", width=6, command=lambda: self._reset_channel(name)).grid(
+            row=3, column=3, sticky="e")
+        return row
+
+    def _select_hole(self, name: str) -> None:
+        if self.ch_selected.get() != name:
+            self.ch_selected.set(name)
+            self._mark_selected()
+            self._see_row(name)
+            self.draw()
+
+    def _see_row(self, name: str) -> None:
+        """Scroll the pane so the hole's block is in view."""
+        row = self.ch_rows.get(name)
+        if row is None:
+            return
+        self.ch_list.update_idletasks()
+        total = max(self.ch_list.winfo_height(), 1)
+        top, bottom = self.ch_scroll.yview()
+        y0, y1 = row.block.winfo_y() / total, (row.block.winfo_y() + row.block.winfo_height()) / total
+        if y0 < top:
+            self.ch_scroll.yview_moveto(y0)
+        elif y1 > bottom:
+            self.ch_scroll.yview_moveto(max(0.0, y1 - (bottom - top)))
+
+    def _mark_selected(self) -> None:
+        for name, row in self.ch_rows.items():
+            mine = name == self.ch_selected.get()
+            row.block.configure(foreground="#8e24aa" if mine else "#202124",
+                                highlightbackground="#8e24aa", highlightthickness=2 if mine else 0)
 
     def _channel_pairs(self) -> tuple[HolePair, ...]:
         return self.plan.generated.holes if self.plan is not None else ()
@@ -1251,47 +1543,42 @@ class SlicerWindow:
     def _edit_channels_changed(self) -> None:
         if self.edit_channels.get():
             self.mouse_moves.set(False)
-            self.channel_bar.pack(fill=tk.X, after=self.section_bar)
-            names = [p.name for p in self._channel_pairs()]
-            self.ch_hole_box.configure(values=names)
-            if names and self.ch_vars["hole"].get() not in names:
-                self.ch_vars["hole"].set(names[0])
-            self._load_channel_fields()
-            self.status.set(
-                "Edit channels: click a hole to pick it, drag the round handle along the hole and the square one "
-                "to turn the channel; the cut is worked out again when you let go."
-                if names else "Edit channels: press Preview first; the drawings have no holes yet.")
+            self.channel_pane.pack(side=tk.RIGHT, fill=tk.Y, before=self.canvas)
+            self._build_channel_rows()
+            self._update_pending()
+            self.status.set("Edit channels: set each hole's channel in the pane at the right, or drag its "
+                            "handles; then press Cut.")
         else:
-            self.channel_bar.pack_forget()
+            self.channel_pane.pack_forget()
         self.draw()
 
-    def _channel_spec(self) -> ChannelSpec:
-        """The spec in the channel fields (the stored one where a field is not a number)."""
-        old = self._channel_specs().get(self.ch_vars["hole"].get(), ChannelSpec())
+    def _channel_spec(self, name: str) -> ChannelSpec:
+        """The spec in a hole's fields (the stored one where a field is not a number)."""
+        row = self.ch_rows[name]
+        old = self._channel_specs().get(name, ChannelSpec())
         values = {}
         for key in ("angle", "offset", "entry", "radius"):
-            number = _number(self.ch_vars[key].get())
+            number = _number(row.vars[key].get())
             values[key] = getattr(old, key) if number is None else number
-        return ChannelSpec(self.ch_vars["shape"].get(), values["angle"], values["offset"], values["entry"],
+        return ChannelSpec(row.vars["shape"].get(), values["angle"], values["offset"], values["entry"],
                            max(values["radius"], 0.1))
 
-    def _load_channel_fields(self) -> None:
-        spec = self._channel_specs().get(self.ch_vars["hole"].get(), ChannelSpec())
-        self._show_channel_spec(spec)
-        self.draw()
-
-    def _show_channel_spec(self, spec: ChannelSpec) -> None:
-        self.ch_vars["shape"].set(spec.shape)
+    def _show_channel_spec(self, name: str, spec: ChannelSpec) -> None:
+        row = self.ch_rows.get(name)
+        if row is None:
+            return
+        row.vars["shape"].set(spec.shape)
         for key in ("angle", "offset", "entry", "radius"):
-            self.ch_vars[key].set(f"{getattr(spec, key):g}")
-        for key, spin in self.ch_spins.items():
+            row.vars[key].set(f"{getattr(spec, key):g}")
+        for key, spin in row.spins.items():
             used = (spec.shape == "straight" and key in ("angle", "offset")) or (
                 spec.shape == "curved" and key in ("angle", "entry", "radius"))
             spin.state(["!disabled"] if used else ["disabled"])
 
-    def _channel_shape_changed(self) -> None:
+    def _channel_shape_changed(self, name: str) -> None:
         """A new shape starts from where the automatic channel was: up or down out of the hole."""
-        name, shape = self.ch_vars["hole"].get(), self.ch_vars["shape"].get()
+        self._select_hole(name)
+        shape = self.ch_rows[name].vars["shape"].get()
         old = self._channel_specs().get(name, ChannelSpec())
         pair = next((p for p in self._channel_pairs() if p.name == name), None)
         up = pair is None or pair.slit == "upper"
@@ -1303,37 +1590,40 @@ class SlicerWindow:
             spec = ChannelSpec(shape, old.angle, old.offset, old.entry, old.radius)
         self._store_channel(name, spec)
 
-    def _channel_fields_changed(self) -> None:
-        name = self.ch_vars["hole"].get()
-        if not name or self.ch_vars["shape"].get() == "auto":
+    def _channel_fields_changed(self, name: str) -> None:
+        if name not in self.ch_rows or self.ch_rows[name].vars["shape"].get() == "auto":
             return
-        spec = self._channel_spec()
+        spec = self._channel_spec(name)
         if spec != self._channel_specs().get(name):
             self._store_channel(name, spec)
 
-    def _reset_channel(self) -> None:
-        self._store_channel(self.ch_vars["hole"].get(), ChannelSpec())
+    def _reset_channel(self, name: str) -> None:
+        self._select_hole(name)
+        self._store_channel(name, ChannelSpec())
 
-    def _store_channel(self, name: str, spec: ChannelSpec, preview: bool = True) -> None:
+    def _store_channel(self, name: str, spec: ChannelSpec) -> None:
+        """Keep an edited channel and draw it; the cut is only worked out again by Cut."""
         if not name:
             return
         specs = self._channel_specs()
         specs[name] = spec
         self.vars["channels"].set(specs_to_text(specs))
-        self._show_channel_spec(spec)
+        self._show_channel_spec(name, spec)
+        self._update_pending()
         self.draw()
-        if preview:
-            self._queue_channel_preview()
 
-    def _queue_channel_preview(self) -> None:
-        if self._channel_after is not None:
-            self.root.after_cancel(self._channel_after)
-        self._channel_after = self.root.after(CHANNEL_PREVIEW_MS, self._channel_preview)
+    def _channels_pending(self) -> bool:
+        """True if the channels being edited differ from those of the cut on screen."""
+        return self.plan is not None and self._channel_specs() != self.plan.request.settings.channels
 
-    def _channel_preview(self) -> None:
-        self._channel_after = None
+    def _update_pending(self) -> None:
+        self.ch_pending.set("changed, not cut yet: press Cut" if self._channels_pending() else "")
+
+    def _cut_channels(self) -> None:
+        """Cut button: build the job and run the CAM with the edited channels."""
         if self.plan is not None:
             self.preview(quiet=True)
+        self._update_pending()
 
     def _shifted(self, points: "list[Point] | tuple[Point, ...]") -> list[Point]:
         assert self.plan is not None
@@ -1348,17 +1638,25 @@ class SlicerWindow:
             return
         found = preview_channels(plan.generated.holes, self._channel_specs(), plan.generated.outers,
                                  plan.request.settings.max_segment_length)
-        problems = []
+        self.ch_found = found
+        for name, row in self.ch_rows.items():
+            preview = found.get(name)
+            if preview is None:
+                row.note.set("automatic: straight up or down")
+            elif preview.problem:
+                row.note.set("cannot cut: " + preview.problem)
+            elif preview.root is not None and preview.root.into:
+                row.note.set(f"ends in {preview.root.into}")
+            else:
+                row.note.set("ends at the outer contour")
         for pair in plan.generated.holes:
-            selected = pair.name == self.ch_vars["hole"].get()
+            selected = pair.name == self.ch_selected.get()
             cx, cy = self._to_canvas(self._shifted([area_centre(list(pair.root_drawn))]))
             c.create_text(cx, cy, text=pair.name, fill="#8e24aa" if selected else "#5f6368",
                           font=("Segoe UI", 8, "bold" if selected else "normal"))
             preview = found.get(pair.name)
             if preview is None:
                 continue
-            if preview.problem:
-                problems.append(f"{pair.name}: {preview.problem}")
             if preview.root is None or preview.tip is None:
                 continue
             for path, colour in ((preview.tip, COLOURS["tip"]), (preview.root, COLOURS["root"])):
@@ -1372,24 +1670,19 @@ class SlicerWindow:
             c.create_rectangle(ax - 6, ay - 6, ax + 6, ay + 6, fill="white", outline=edge, width=2)
             self.channel_handles[(pair.name, "entry")] = (ex, ey)
             self.channel_handles[(pair.name, "angle")] = (ax, ay)
-        if problems:
-            c.create_text(10, LEGEND_HEIGHT + 4, anchor="nw", fill="#d93025", text="\n".join(problems))
 
     def _channel_press(self, event: "tk.Event[tk.Canvas]") -> None:
         for key, (hx, hy) in self.channel_handles.items():
             if (event.x - hx) ** 2 + (event.y - hy) ** 2 <= HANDLE_PIXELS ** 2:
                 self._channel_drag = key
-                if self.ch_vars["hole"].get() != key[0]:
-                    self.ch_vars["hole"].set(key[0])
-                    self._load_channel_fields()
+                self._select_hole(key[0])
                 return
         p = self._to_world(event.x, event.y)
         if p is None:
             return
         for pair in self._channel_pairs():
             if any(inside(p, self._shifted(loop)) for loop in (pair.root_drawn, pair.tip_drawn)):
-                self.ch_vars["hole"].set(pair.name)
-                self._load_channel_fields()
+                self._select_hole(pair.name)
                 return
 
     def _channel_move(self, event: "tk.Event[tk.Canvas]") -> None:
@@ -1411,12 +1704,10 @@ class SlicerWindow:
             spec = replace(spec, offset=round(d[0] * (p[1] - cz) - d[1] * (p[0] - cx), 1))  # + to the left
         else:
             spec = replace(spec, entry=round(towards))
-        self._store_channel(name, spec, preview=False)
+        self._store_channel(name, spec)
 
     def _channel_release(self) -> None:
-        if self._channel_drag is not None:
-            self._channel_drag = None
-            self._queue_channel_preview()
+        self._channel_drag = None
 
     # --- section view: zoom, pan, and moving the wire with the mouse -----------------------
 
@@ -1529,10 +1820,17 @@ class SlicerWindow:
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="foamdxf-gui", description="Foam cutter DXF slicer")
+    parser.add_argument("project", nargs="?", type=Path, help="project file to open")
+    parser.add_argument("--ui-size", help="UI size, e.g. 0.7 or 70%% (default: View > UI size)")
+    args = parser.parse_args(argv)
     root = tk.Tk()
+    size = args.ui_size if args.ui_size is not None else load_machine_settings().get(UI_SIZE_KEY, 1.0)
+    apply_ui_size(root, parse_ui_size(size))
     window = SlicerWindow(root)
-    if argv:
-        root.after(100, lambda: window.open_project(Path(argv[0])))
+    if args.project is not None:
+        project = args.project
+        root.after(100, lambda: window.open_project(project))
     root.mainloop()
     return 0
 

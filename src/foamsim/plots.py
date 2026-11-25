@@ -98,7 +98,7 @@ def write_animation(result: SimResult, path: Path | str, max_frames: int = 150) 
     ax: Any = fig.add_subplot(projection="3d")  # mplot3d has no type information
     b = result.job.block
     ys = sorted(t.y for t in result.targets.values())
-    _box(ax, (b.x, b.x + b.length), (ys[0], ys[1]), (0.0, b.height))
+    _box(ax, (b.x, b.x + b.length), (ys[0], ys[1]), (b.z, b.z + b.height))
     for target in result.targets.values():
         outer = _closed(target.outer)
         ax.plot(outer[:, 0], np.full(len(outer), target.y), outer[:, 1], color="black", lw=0.6)
