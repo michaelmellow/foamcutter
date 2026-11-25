@@ -890,3 +890,31 @@ NOT verified: on the machine. The move to the start goes across at the
 wire's current height first, so the wire must be above or beside the foam
 when it is pressed. The cut runs the full travel, from limit to limit. The
 kerf is not compensated: the cut is centred on the height.
+
+## 18. Fitting on high-DPI screens (owner's report)
+
+With Windows display scaling at 200 % the window did not fit on the screen:
+the process is not DPI aware, so Windows stretches it 2x, and the form alone
+needs about 840 px of height (1440p at 200 % gives 720).
+
+Built (src/foamdxf/uiscale.py):
+
+- **View > UI size** (100, 90, 80, 70, 60 %), kept in the machine settings
+  file (`ui_size`), or `--ui-size 0.7` / `70%` on the GUI command line. It
+  multiplies Tk's font scaling; widgets sized by their text shrink with it.
+  It takes effect at the next start (Tk does not re-measure fonts in use).
+- **Scroll bars on the whole window**, shown only when the window is smaller
+  than the content needs: the form's height, and the form's width plus
+  560 px for the tabs. The mouse wheel over the form scrolls up and down; the
+  views keep the wheel for zooming.
+- The window opens at 1200 x 760 or the screen size, whichever is smaller,
+  and can be made as small as 640 x 420.
+
+Verified: unit tests (tests/dxf/test_uiscale.py: size parsing, font
+scaling, opening size, bars only when needed); screenshots at 1280 x 640
+with 100 % and 70 %, and at 800 x 500.
+
+NOT verified: on an actual 200 % monitor. Sizes given in pixels (the
+window's opening size, note wrap widths, the 3D view's compact height) do not
+follow the UI size. The window is not made DPI aware, so Windows still
+stretches it at high scaling and text stays slightly soft.

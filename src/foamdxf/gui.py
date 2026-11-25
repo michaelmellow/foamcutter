@@ -8,6 +8,7 @@ file in one .foamproj file (see project.py). Uses Tkinter only (part of Python),
 packages. The last values are remembered in ~/.foamdxf-gui.json.
 """
 
+import argparse
 import functools
 import json
 import math
@@ -47,7 +48,9 @@ from .machine import (
     MOUSE_FEED_MIN,
     MachinePanel,
     Program,
+    load_machine_settings,
     on_wire,
+    save_machine_settings,
     tower_positions,
     tower_targets,
 )
@@ -72,6 +75,14 @@ from .project import open_project as read_project
 from .project import save_project as write_project
 from .sender import Status
 from .step import StepModel, read_step, sections
+from .uiscale import (
+    UI_SIZE_KEY,
+    UI_SIZES,
+    ScrollArea,
+    apply_ui_size,
+    fit_to_screen,
+    parse_ui_size,
+)
 from .view3d import View3D
 
 REPO = Path(__file__).resolve().parents[2]
@@ -128,6 +139,7 @@ COLOURS = {
 
 
 VIEW3D_SHARE = 0.4  # the 3D view's first share of the Machine tab's width
+RIGHT_PANE_MIN = 560  # px the tabs keep beside the form before the window scrolls sideways
 STOCK_NOTE_WIDTH = 420  # wrap of the Stock tab's notes, px
 STRAIGHT_WIRE_MM = 0.05  # towers closer than this: the wire runs along a stock edge
 TABLE_TOLERANCE_MM = 0.01  # a stock bottom this far below the table is still on it
@@ -280,8 +292,7 @@ class SlicerWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title("Foam cutter: DXF slicer")
-        root.geometry("1200x760")
-        root.minsize(900, 560)
+        fit_to_screen(root, 1200, 760)
         self.vars: dict[str, tk.StringVar] = {k: tk.StringVar(value=v) for k, v in load_settings().items()}
         self.plan: Plan | None = None
         self.result: CamResult | None = None
@@ -310,7 +321,10 @@ class SlicerWindow:
         self.status = tk.StringVar(value="Pick the two DXFs, then press Preview.")
         ttk.Label(root, textvariable=self.status, anchor="w", padding=(8, 3), relief="sunken").pack(
             side=tk.BOTTOM, fill=tk.X)
-        paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+        # the whole window scrolls when it is smaller than the form (high display scaling)
+        self.scroll = ScrollArea(root, lambda: (form.winfo_reqwidth() + RIGHT_PANE_MIN, paned.winfo_reqheight()))
+        self.scroll.pack(fill=tk.BOTH, expand=True)
+        paned = ttk.PanedWindow(self.scroll.body, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
         form = ttk.Frame(paned, padding=8)
         right = ttk.Frame(paned)
@@ -319,6 +333,7 @@ class SlicerWindow:
 
         self._build_menu()
         self._build_form(form)
+        self.scroll.wheel_scrolls(form)
         self._build_right(right)
         self.vars["profile"].trace_add("write", lambda *_: self._load_kerf_tables())
         self._load_kerf_tables()
@@ -351,11 +366,25 @@ class SlicerWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.close)
         menubar.add_cascade(label="File", menu=file_menu)
+        view_menu = tk.Menu(menubar, tearoff=False)
+        size_menu = tk.Menu(view_menu, tearoff=False)
+        self.ui_size = tk.DoubleVar(value=parse_ui_size(load_machine_settings().get(UI_SIZE_KEY, 1.0)))
+        for size in UI_SIZES:
+            size_menu.add_radiobutton(label=f"{size:.0%}", value=size, variable=self.ui_size,
+                                      command=self._ui_size_chosen)
+        view_menu.add_cascade(label="UI size", menu=size_menu)
+        menubar.add_cascade(label="View", menu=view_menu)
         self.root.configure(menu=menubar)
         self.root.bind_all("<Control-n>", lambda _e: self.new_project())
         self.root.bind_all("<Control-o>", lambda _e: self.open_project())
         self.root.bind_all("<Control-s>", lambda _e: self.save_project())
         self.root.bind_all("<Control-S>", lambda _e: self.save_project_as())
+
+    def _ui_size_chosen(self) -> None:
+        self.machine.settings[UI_SIZE_KEY] = self.ui_size.get()
+        save_machine_settings(self.machine.settings)
+        messagebox.showinfo("UI size", f"The UI opens at {self.ui_size.get():.0%} from the next start.",
+                            parent=self.root)
 
     def modified(self) -> bool:
         return self.values() != self.saved_values
@@ -1791,10 +1820,17 @@ class SlicerWindow:
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="foamdxf-gui", description="Foam cutter DXF slicer")
+    parser.add_argument("project", nargs="?", type=Path, help="project file to open")
+    parser.add_argument("--ui-size", help="UI size, e.g. 0.7 or 70%% (default: View > UI size)")
+    args = parser.parse_args(argv)
     root = tk.Tk()
+    size = args.ui_size if args.ui_size is not None else load_machine_settings().get(UI_SIZE_KEY, 1.0)
+    apply_ui_size(root, parse_ui_size(size))
     window = SlicerWindow(root)
-    if argv:
-        root.after(100, lambda: window.open_project(Path(argv[0])))
+    if args.project is not None:
+        project = args.project
+        root.after(100, lambda: window.open_project(project))
     root.mainloop()
     return 0
 
