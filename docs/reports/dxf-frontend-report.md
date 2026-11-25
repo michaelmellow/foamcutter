@@ -1066,3 +1066,101 @@ NOT verified: on the machine. A point beyond the table is a guess; the
 dialog and the report say so. Only the first out-of-range speed of a
 Preview is offered; a second one (the other end) comes up at the next
 Preview.
+
+## 22. Cuts past the axis travel: previewed, marked, Start blocked (owner's request, branch `sync-check`)
+
+Owner's report: the ElectronicsPlane STEP job previews with a 25 mm chord
+margin but is refused ("axis 3 (X) goes to -2.13, beyond its min 0") with a
+smaller one. Cause, checked: not a bug. The margin is measured from the
+stock's back face, which stays at Block X = 4, so a smaller margin moves the
+part toward x 0. The wing is swept (root LE at x 94, tip LE at x 24 with a
+20 mm margin) and the wire runs on 145 mm past the tip face to the 3-4 tower,
+about 25 mm further toward x 0. With Block X moved out by what the margin
+lost (20 mm margin at 6.5, 5 mm margin at 21.5) the cut goes through.
+
+Owner's request: make the G-code anyway, highlight the out-of-travel parts in
+the 2D and 3D views, and block Start until the stock is moved.
+
+Built:
+- foamcam: `generate(job, profile, allow_out_of_travel=False)`. Default
+  unchanged (the CLI and every other caller still refuse, §11.1). When
+  allowed and the soft limits are the only problem, the program is made: its
+  first line is the comment "OUT OF TRAVEL: an axis passes its limit, do not
+  run as placed", the report ends with an OUT OF TRAVEL section naming each
+  axis, the amount and the program line (counted with that comment), and
+  `CamResult.out_of_travel` lists the problems. Any other problem (wire
+  angle, speed ratio, rate, kerf range) still refuses, and the refusal also
+  lists the limit problems.
+- pipeline.py: `run_cam(plan, allow_out_of_travel)`; `stock_shift` (how far
+  in x the stock may move for axes 1 and 3 to fit: shortest and longest);
+  per-point flags `beyond_12` / `beyond_34` in PreviewGeometry and
+  `beyond_runs` for drawing them.
+- gui.py: Preview allows it. The status bar says what is past the travel and
+  where to move the stock (rounded inward to 0.1 mm, and as a back-face x
+  range), the carriage paths past the travel are drawn thick pink in the
+  section view, with a legend line. `_current_program` refuses with "the cut
+  goes past the axis travel ...", so the Machine tab shows that instead of
+  the program and Start stays disabled; it comes back after a Preview that
+  fits. Generate still writes the files (marked), and the status says not to
+  run them as placed.
+- view3d.py: the same pink on the carriage paths and on the wire lines that
+  need an axis past its travel, with a legend line.
+
+Verified: tests/cam/test_out_of_travel.py (refused by default; allowed:
+marked header, the problem's line number points at the offending value,
+report section; inside the travel the allowed program is identical; another
+problem still refuses); tests/dxf/test_out_of_travel.py (runs; the window
+with the stock 60 mm toward x 0: previewed, marked, status hint, pink drawn,
+Start's program refused, then moved back: no flag, program given). check.py
+cam and dxf pass; sim has the same 19 failures as before. On the owner's
+saved job: margin 20 shows "move the stock 2.2 to 11.0 mm away from the
+operator", and Block X 6.5 then previews clean. Screenshot with a 5 mm margin.
+
+NOT verified: on the machine. A G-code file written while out of travel is
+marked in its header only; a sender other than this window would run it.
+Format: job-file.md §11.1 gains the paragraph "Soft limits only, when the
+caller allows it" (owner approved the change).
+
+## 23. Placing the stock from above (owner's request, branch `sync-check`)
+
+Owner's request: position the stock in a top-down view by one of nine points
+(corners, edge midpoints, centre), given as its distance from the machine
+corner nearest the operator on the X/Y tower side, so the stock can sit
+nearer a tower instead of centred: a big taper or sweep then needs less
+travel at the far tower.
+
+Reading of the request (from the code, not from the machine): the operator
+is at the smallest x (the section view's "+x away from operator"); the X/Y
+tower is the axes 3-4 tower at y = wire_span. The reference corner is
+(travel min x, wire_span); x is measured away from the operator, y from that
+tower toward the other one.
+
+Built:
+- jobgen.py: `Placement.root_y` (None = centred as before). The job's
+  comment line no longer says "centred" when it is set.
+- gui.py: a third Stock field "Root face y" (`block_y`, blank = centred), in
+  the Stock tab with the other two and in projects and settings.
+- topview.py, a "Top view" tab beside Stock in the Machine tab's controls:
+  the two towers, the shared x travel, the stock of the last Preview between
+  its root and tip faces, the nine points (click one; default the corner
+  nearest the reference corner), the reference corner in green with dashed
+  lines to the chosen point, and two entries with that point's distances.
+  Drawn as the 3D view seen from above (owner's check): x up, the operator
+  at the bottom, the X/Y tower on the left.
+  Place sets Back face x and Root face y and previews again; Centre blanks
+  both. Distances are shown to 0.001 mm, so Place without an edit leaves the
+  stock where it is.
+
+Verified: tests/dxf/test_topview.py (the nine points and distances; placing
+each of the nine points puts it at the typed distances; in the window, Place
+moves the stock and the job's section planes, Centre restores the centred
+placement). check.py dxf and cam pass; sim has the same 19 failures. On the
+owner's ElectronicsPlane job with a 5 mm chord margin and the stock at
+x = 4: centred it is out of travel by 17.1 mm (axis 3); with the stock's
+near corner 100 mm from the X/Y tower it is still out by 9.3 mm; at 40 mm
+and 10 mm it cuts. Screenshot of the tab at 40 mm.
+
+NOT verified: on the machine; how close to a tower the foam can really sit
+(the carriage, wire clamp and spring) is not known to the software, so it
+does not stop a placement near a tower beyond the CAM's own check that both
+faces lie between the carriage planes.

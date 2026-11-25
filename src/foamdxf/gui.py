@@ -70,12 +70,14 @@ from .pipeline import (
     PreviewGeometry,
     Request,
     alignment_edges,
+    beyond_runs,
     block_at_corner,
     make_job,
     outline_size,
     preview_geometry,
     read_outlines,
     run_cam,
+    stock_shift,
     write_files,
 )
 from .project import SUFFIX
@@ -84,6 +86,7 @@ from .project import save_project as write_project
 from .sender import Status
 from .step import StepModel, read_step, sections
 from .syncview import SyncView
+from .topview import TopView
 from .uiscale import (
     UI_SIZE_KEY,
     UI_SIZES,
@@ -123,6 +126,7 @@ CUT_FIELDS = [
 STOCK_FIELDS = [
     ("block_x", "Back face x", "", "mm, blank = centred"),
     ("block_z", "Bottom face z", "", "mm, blank = on the table"),
+    ("block_y", "Root face y", "", "mm, blank = centred"),
 ]
 DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS + STOCK_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
@@ -145,6 +149,7 @@ COLOURS = {
     "tower_12": "#1f6fb4",
     "tower_34": "#e8710a",
     "target": "#202124",
+    "beyond": "#e52592",  # the parts of a carriage path past the axis travel
 }
 
 
@@ -210,6 +215,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         lead_in=req("lead_in", labels["lead_in"]),
         safe_clearance=req("safe_clearance", labels["safe_clearance"]),
         block_z=number("block_z", labels["block_z"], optional=True),
+        root_y=number("block_y", labels["block_y"], optional=True),
     )
     exit_text = values.get("channel_exit", "rapid").strip().lower() or "rapid"
     channel_exit: str | float = exit_text
@@ -431,6 +437,7 @@ class SlicerWindow:
         self.draw()
         self.view3d.show(None)
         self.sync_view.show(None)
+        self.top_view.show(None)
         self._update_alignment()
         self._update_readout(0)
         self.wire_label.set("")
@@ -843,6 +850,8 @@ class SlicerWindow:
                               target=lambda: self.vars["speed"].get(), saved=self._kerf_saved)
         self.machine.controls.add(self.kerf, text="Kerf")
         self.machine.controls.add(self.stock_pane, text="Stock")
+        self.top_view = TopView(self.machine.controls, self._place_from_top, self._centre_stock)
+        self.machine.controls.add(self.top_view, text="Top view")
         self.cross_cut = CrossCutPanel(self.machine.controls, self.machine, profile=self._profile)
         self.machine.controls.add(self.cross_cut, text="Cut")
         self.machine.views.insert(0, self.section_frame, text="Section")
@@ -930,6 +939,21 @@ class SlicerWindow:
         self._corner_changed()
         self._show_live_wire()
 
+    def _place_from_top(self, block_x: float, root_y: float) -> None:
+        """The Top view placed the stock: set Back face x and Root face y, then preview."""
+        self.vars["block_x"].set(_fixed(block_x))
+        self.vars["block_y"].set(_fixed(root_y))
+        self.preview()
+        if self.geometry is not None:
+            self.status.set(f"Stock placed from the top view: back face x = {block_x:.3f}, "
+                            f"root face y = {root_y:.3f}. " + self.status.get())
+
+    def _centre_stock(self) -> None:
+        """The Top view's Centre: the default placement in x and y."""
+        self.vars["block_x"].set("")
+        self.vars["block_y"].set("")
+        self.preview()
+
     def _corner_edge(self) -> AlignEdge | None:
         """The selected corner's long edge in the last preview, or None."""
         if self.geometry is None:
@@ -1008,10 +1032,35 @@ class SlicerWindow:
                         f"back face x = {x:.3f}, bottom face z = {z:.3f}.")
         self.preview()
 
+    def travel_note(self) -> str:
+        """What is past the axis travel in the last Preview, and where to move the stock."""
+        assert self.result is not None and self.plan is not None
+        first = self.result.out_of_travel[0].split(" (program line")[0]
+        shift = stock_shift(self.result, self.plan.profile)
+        if shift is None:
+            where = "moving the stock in x does not fix it"
+        else:
+            def up(v: float) -> float:  # to 0.1 mm, inward, so the rounded numbers still fit
+                return math.ceil(v * 10 - 1e-9) / 10
+
+            def down(v: float) -> float:
+                return math.floor(v * 10 + 1e-9) / 10
+
+            block_x = self.plan.job.block.x
+            where = (f"move the stock {up(abs(shift[0])):.1f} to {down(abs(shift[1])):.1f} mm "
+                     f"{'away from' if shift[0] > 0 else 'toward'} the operator "
+                     f"(stock back face x {up(block_x + min(shift)):.1f} to {down(block_x + max(shift)):.1f})")
+        return (f"OUT OF TRAVEL: {first}; {where}. Start is blocked until the stock is moved "
+                "and Preview is pressed again.")
+
     def _current_program(self) -> Program:
-        """The G-code of the last Preview, for the Machine tab. Raises ValueError if stale."""
+        """The G-code of the last Preview, for the Machine tab. Raises ValueError if stale
+        or if the cut passes an axis limit."""
         if self.plan is None or self.result is None or self.preview_values is None:
             raise ValueError("press Preview first")
+        if self.result.out_of_travel:
+            raise ValueError("the cut goes past the axis travel (pink in the views): move the stock "
+                             "and press Preview again")
         ignore = ("out",)
         now = {k: v for k, v in self.values().items() if k not in ignore}
         then = {k: v for k, v in self.preview_values.items() if k not in ignore}
@@ -1226,7 +1275,7 @@ class SlicerWindow:
         try:
             request = request_from_form(self.values())
             self.plan = make_job(request)
-            self.result = run_cam(self.plan)
+            self.result = run_cam(self.plan, allow_out_of_travel=True)
             self.geometry = preview_geometry(self.plan, self.result)
         except (FormError, DxfError, FoamcamError) as error:
             if quiet and before[0] is not None:
@@ -1241,6 +1290,7 @@ class SlicerWindow:
             self.draw()
             self.view3d.show(None)
             self.sync_view.show(None)
+            self.top_view.show(None)
             self._update_alignment()
             self.wire_label.set("")
             self._update_readout(0)
@@ -1251,11 +1301,14 @@ class SlicerWindow:
         self._show_report(self._plan_text() + "\n" + self.result.report)
         self.status.set(f"OK: cut time {self.result.total_time:.2f} min, "
                         f"{sum(m.kind != 'rapid' for m in self.result.moves)} feed moves. Press Generate to write files.")
+        if self.result.out_of_travel:
+            self.status.set(self.travel_note())
         if self.tabs.select() == str(self.report_frame):  # type: ignore[no-untyped-call]
             self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
         self.draw()
         self.view3d.show(self.geometry)
         self.sync_view.show(self.geometry)
+        self.top_view.show(self.geometry, self._letters())
         self._update_alignment()
         self.scrubber.configure(to=len(self.geometry.tower_12) - 1)
         self.wire_pos.set(0)
@@ -1313,7 +1366,9 @@ class SlicerWindow:
         except OSError as error:
             messagebox.showerror("Cannot write files", str(error))
             return
-        self.status.set(f"Wrote {len(written)} files to {out}: {', '.join(p.name for p in written)}")
+        self.status.set(f"Wrote {len(written)} files to {out}: {', '.join(p.name for p in written)}"
+                        + ("  OUT OF TRAVEL: do not run it with the stock where it is."
+                           if self.result.out_of_travel else ""))
 
     def open_folder(self) -> None:
         out = Path(self.vars["out"].get() or REPO / "output")
@@ -1403,6 +1458,9 @@ class SlicerWindow:
                            fill=COLOURS["stock"], outline=COLOURS["stock_edge"])
         c.create_line(*self._to_canvas(g.tower_12), fill=COLOURS["tower_12"], dash=(5, 3))
         c.create_line(*self._to_canvas(g.tower_34), fill=COLOURS["tower_34"], dash=(5, 3))
+        for path, flags in ((g.tower_12, g.beyond_12), (g.tower_34, g.beyond_34)):
+            for run in beyond_runs(path, flags):
+                c.create_line(*self._to_canvas(run), fill=COLOURS["beyond"], width=4)
         c.create_line(*self._to_canvas(g.root_cut), fill=COLOURS["root"], width=2)
         c.create_line(*self._to_canvas(g.tip_cut), fill=COLOURS["tip"], width=2)
         for target in (g.root_target, g.tip_target, *g.root_holes, *g.tip_holes):
@@ -1428,6 +1486,8 @@ class SlicerWindow:
             (COLOURS["stock_edge"], None, 6, "stock"),
             (COLOURS["travel"], (4, 3), 1, "shared travel"),
         ]
+        if any(g.beyond_12) or any(g.beyond_34):
+            legend.append((COLOURS["beyond"], None, 4, "past the axis travel: move the stock"))
         for i, (colour, dash, width, label) in enumerate(legend):
             lx, y = _legend_slot(i)
             c.create_line(lx, y, lx + 28, y, fill=colour, width=width, dash=dash or ())

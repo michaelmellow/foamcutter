@@ -17,7 +17,7 @@ import tkinter as tk
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .pipeline import PreviewGeometry
+from .pipeline import PreviewGeometry, beyond_runs
 
 Point2 = tuple[float, float]
 
@@ -46,6 +46,7 @@ COLOURS = {
     "live": "#9334e6",
     "text": "#202124",
     "muted": "#5f6368",
+    "beyond": "#e52592",
 }
 
 
@@ -222,6 +223,13 @@ class View3D:
         # carriage paths at the tower planes, cut and outline at the foam faces
         self._line([(x, 0.0, z) for x, z in g.tower_12], COLOURS["root"], dash=(5, 3))
         self._line([(x, W, z) for x, z in g.tower_34], COLOURS["tip"], dash=(5, 3))
+        for path, flags, y in ((g.tower_12, g.beyond_12, 0.0), (g.tower_34, g.beyond_34, W)):
+            for run in beyond_runs(path, flags):
+                self._line([(x, y, z) for x, z in run], COLOURS["beyond"], width=4)
+        for i, (f12, f34) in enumerate(zip(g.beyond_12, g.beyond_34)):
+            if f12 or f34:  # the wire lines that need an axis past its travel
+                a, b = g.tower_12[i], g.tower_34[i]
+                self._line([(a[0], 0.0, a[1]), (b[0], W, b[1])], COLOURS["beyond"])
         self._line([(x, ya, z) for x, z in g.root_cut], COLOURS["root"], width=2)
         self._line([(x, yb, z) for x, z in g.tip_cut], COLOURS["tip"], width=2)
         self._line([(x, ya, z) for x, z in g.root_target], COLOURS["text"], closed=True)
@@ -276,6 +284,8 @@ class View3D:
         ]
         if self.live is not None:
             items.append((COLOURS["live"], (8, 4), 3, "wire now (machine)"))
+        if any(g.beyond_12) or any(g.beyond_34):
+            items.append((COLOURS["beyond"], (), 4, "past the axis travel: move the stock"))
         _, h = self._size()
         step = 16 if h >= COMPACT_HEIGHT else 13
         for k, (colour, dash, width, label) in enumerate(items):

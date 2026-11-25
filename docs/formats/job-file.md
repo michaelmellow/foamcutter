@@ -634,6 +634,19 @@ any of these fails:
 
 Nothing is clipped or adjusted to make a check pass.
 
+**Soft limits only, when the caller allows it.** A caller may ask the CAM to
+make the program when the soft limits are the only checks that fail (so the
+user can see where the cut leaves the travel, and move the stock). The
+program is then made, and marked: its first line is the comment
+`(OUT OF TRAVEL: an axis passes its limit, do not run as placed)`, the
+report ends with an "OUT OF TRAVEL" section listing each soft-limit error
+as above (its line numbers count that comment), and the caller is given
+the same list. Such a program must not be run as placed; a caller that
+sends programs to the machine refuses to send it. If any other check fails,
+the CAM refuses as above, and the refusal lists the soft-limit errors too.
+Without that request (the default) a soft-limit error refuses like the
+others.
+
 ## 12. Mirror (CAM)
 
 `mirror: true` produces the reflection of the panel in the plane

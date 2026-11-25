@@ -4,8 +4,10 @@ job file (docs/formats/job-file.md).
 Placement rules:
 
 - **Along the wire (y).** The two section planes are centred between the
-  carriage planes: `root.y = (wire_span - span) / 2`, `tip.y = root.y + span`.
-  The root is nearer the left tower; use the job's `mirror` for the other hand.
+  carriage planes: `root.y = (wire_span - span) / 2`, `tip.y = root.y + span`,
+  unless `root_y` places the root face (e.g. nearer a tower, so a big taper
+  needs less travel). The root is nearer the axes 1-2 tower (y = 0); use the
+  job's `mirror` for the other hand.
 - **In the section plane (x, z).** Both DXFs are drawn in one coordinate frame,
   so sweep, dihedral and twist are whatever the drawings show. The bounding box
   of both outlines together is centred in the stock (length along x, height
@@ -40,6 +42,7 @@ class Placement:
     lead_in: float = 20.0  # mm in front of the stock
     safe_clearance: float = 20.0  # mm above the stock for the safe position
     block_z: float | None = None  # G54 z of the stock's bottom face; None = on the table
+    root_y: float | None = None  # y of the root face; None = both faces centred between the towers
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,7 @@ def build_job(
     z0 = profile.table_z if placement.block_z is None else placement.block_z
     dz = z0 + (placement.stock_height - height) / 2 - zmin
 
-    y_root = (profile.wire_span - span) / 2
+    y_root = (profile.wire_span - span) / 2 if placement.root_y is None else placement.root_y
     y_tip = y_root + span
     x_entry = block_x + placement.stock_length + placement.lead_in
     z_safe = z0 + placement.stock_height + placement.safe_clearance
@@ -139,7 +142,8 @@ def build_job(
             + (f"on the table at z = {_num(profile.table_z)}." if placement.block_z is None
              else f"bottom face at z = {_num(z0)} (table at z = {_num(profile.table_z)}).")
         ),
-        f"# Section planes y = {_num(y_root)} and y = {_num(y_tip)}, centred between the towers.",
+        f"# Section planes y = {_num(y_root)} and y = {_num(y_tip)}"
+        + (", centred between the towers." if placement.root_y is None else "."),
         'format: "foamcutter-job"',
         "version: 1",
         f"name: {_quote(title)}",

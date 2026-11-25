@@ -1,5 +1,6 @@
 """DXF files (or a STEP model) -> job -> CAM result: the steps shared by the CLI and the GUI."""
 
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -77,9 +78,44 @@ def outline_size(root: DxfOutline, tip: DxfOutline) -> tuple[float, float]:
     return max(xs) - min(xs), max(zs) - min(zs)
 
 
-def run_cam(plan: Plan) -> CamResult:
-    """Run foamcam on the job. Raises FoamcamError when the job cannot be cut."""
-    return generate(plan.job, plan.profile)
+def run_cam(plan: Plan, allow_out_of_travel: bool = False) -> CamResult:
+    """Run foamcam on the job. Raises FoamcamError when the job cannot be cut. With
+    `allow_out_of_travel` a cut whose only problem is an axis limit is made anyway, its
+    problems in result.out_of_travel (the window shows it and blocks Start)."""
+    return generate(plan.job, plan.profile, allow_out_of_travel)
+
+
+def stock_shift(result: CamResult, profile: Profile) -> tuple[float, float] | None:
+    """How far the stock must move in x (+ away from the operator) for the horizontal axes
+    1 and 3 to stay inside their travel: (shortest move, longest move); None if no x move
+    fits (the cut is wider than the travel) or x is not the problem."""
+    low, high = -math.inf, math.inf  # allowed shift range
+    for i in (0, 2):
+        axis = profile.axes[i]
+        values = [m.axes[i] for m in result.moves]
+        low = max(low, axis.min - min(values))
+        high = min(high, axis.max - max(values))
+    if low > high or (low <= 1e-9 and high >= -1e-9):
+        return None
+    return (low, high) if low > 0 else (high, low)
+
+
+def beyond_runs(points: list[Point], flags: tuple[bool, ...]) -> list[list[Point]]:
+    """The stretches of a carriage path where it is past its travel: each a run of points
+    whose segments have a flagged end, for the views to draw over the path."""
+    runs: list[list[Point]] = []
+    for k in range(1, min(len(points), len(flags))):
+        if flags[k - 1] or flags[k]:
+            if runs and runs[-1][-1] == points[k - 1]:
+                runs[-1].append(points[k])
+            else:
+                runs.append([points[k - 1], points[k]])
+    return runs
+
+
+def beyond_travel(axes: tuple[float, ...], profile: Profile, which: tuple[int, ...]) -> bool:
+    """Is any of the axes `which` (0-based) past its travel at `axes`?"""
+    return any(not profile.axes[i].min - 1e-9 <= axes[i] <= profile.axes[i].max + 1e-9 for i in which)
 
 
 def write_files(plan: Plan, result: CamResult | None, out_dir: Path) -> list[Path]:
@@ -117,6 +153,8 @@ class PreviewGeometry:
     safe_position: tuple[float, float, float, float]  # axes 1 to 4
     root_holes: tuple[list[Point], ...] = ()  # inner contours (features), placed, at the root face
     tip_holes: tuple[list[Point], ...] = ()
+    beyond_12: tuple[bool, ...] = ()  # per path point: axis 1 or 2 is past its travel there
+    beyond_34: tuple[bool, ...] = ()  # axis 3 or 4
 
 
 def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
@@ -165,6 +203,8 @@ def preview_geometry(plan: Plan, result: CamResult) -> PreviewGeometry:
         safe_position=job.safe_position,
         root_holes=holes[0],
         tip_holes=holes[1],
+        beyond_12=tuple(beyond_travel(m, profile, (0, 1)) for m in feeds),
+        beyond_34=tuple(beyond_travel(m, profile, (2, 3)) for m in feeds),
     )
 
 

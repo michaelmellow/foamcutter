@@ -53,11 +53,17 @@ class CamResult:
     preview_svg: str
     total_time: float  # minutes, sum of feed move durations
     moves: list[Move]
+    # Axis limits the program passes (§11.1), when generate() was asked to allow them:
+    # the program must not be run with the block where it is.
+    out_of_travel: list[str] = field(default_factory=list)
 
 
-def generate(job: Job, profile: Profile) -> CamResult:
+def generate(job: Job, profile: Profile, allow_out_of_travel: bool = False) -> CamResult:
+    """The G-code, report and preview of a job. Raises CamError if it cannot be cut. With
+    `allow_out_of_travel`, axis limits alone do not refuse it: the program is made, marked
+    in its header and report, and the limits it passes are in CamResult.out_of_travel."""
     root, tip = validate(job, profile)
-    return Cam(job, profile, root, tip).run()
+    return Cam(job, profile, root, tip, allow_out_of_travel).run()
 
 
 def validate(job: Job, profile: Profile) -> tuple[Outline, Outline]:
@@ -172,8 +178,11 @@ def matched_fixed_points(
 
 
 class Cam:
-    def __init__(self, job: Job, profile: Profile, root: Outline, tip: Outline) -> None:
+    def __init__(self, job: Job, profile: Profile, root: Outline, tip: Outline,
+                 allow_out_of_travel: bool = False) -> None:
         self.job = job
+        self.allow_out_of_travel = allow_out_of_travel
+        self.out_of_travel: list[str] = []  # axis limit problems, kept apart when allowed
         self.profile = profile
         self.root = root
         self.tip = tip
@@ -443,25 +452,34 @@ class Cam:
                 move.axes = (a3, a4, a1, a2)
         lines = self.gcode_lines(moves)
         self.check(moves, lines)
+        if self.out_of_travel and not self.problems:
+            # the header warns, which moves every line: check again for the line numbers
+            self.out_of_travel = []
+            lines = self.gcode_lines(moves, warn=True)
+            self.check(moves, lines)
         if self.problems:
-            raise CamError(self.problems)
+            raise CamError(self.problems + self.out_of_travel)
 
         total = sum(m.duration for m in moves)
-        result = CamResult("", "", "", total, moves)
+        result = CamResult("", "", "", total, moves, list(self.out_of_travel))
         from .output import preview_svg, report
 
         result.gcode = "\n".join(lines.text) + "\n"
         result.report = report(job, self.profile, result, self.kerf_used, self.stretches, self.kerf_rounds,
                                self.unmatched_corners)
+        if self.out_of_travel:
+            result.report += "\nOUT OF TRAVEL: do not run this program with the block where it is\n" + "".join(
+                f"  - {p}\n" for p in self.out_of_travel)
         result.preview_svg = preview_svg(job, self.profile, self.root, self.tip, comp_r, comp_t, refs)
         return result
 
     # --- §13 G-code ---------------------------------------------------------
 
-    def gcode_lines(self, moves: list[Move]) -> "Program":
+    def gcode_lines(self, moves: list[Move], warn: bool = False) -> "Program":
         job, profile = self.job, self.profile
         program = Program()
         for text in (
+            *(["OUT OF TRAVEL: an axis passes its limit, do not run as placed"] if warn else []),
             f"foamcam {__version__}",
             f"job: {job.name}",
             f"profile: {profile.name}",
@@ -508,7 +526,7 @@ class Cam:
         for number in sorted(worst):
             excess, value, side, limit, line_number = worst[number]
             axis = profile.axes[number - 1]
-            self.problems.append(
+            (self.out_of_travel if self.allow_out_of_travel else self.problems).append(
                 f"{axis.label} goes to {value:.4f}, beyond its {side} {limit:.4f} by {excess:.4f} mm "
                 f"(program line {line_number})"
             )
