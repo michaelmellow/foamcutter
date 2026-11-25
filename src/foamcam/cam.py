@@ -9,7 +9,7 @@ from . import geometry as g
 from .errors import CamError, ValidationError
 from .geometry import Point
 from .job import RAPID, Job
-from .profile import Profile
+from .profile import KerfTable, Profile
 from .sections import Outline, build_outline, check_in_block
 
 Axes = tuple[float, float, float, float]
@@ -65,6 +65,15 @@ def validate(job: Job, profile: Profile) -> tuple[Outline, Outline]:
     problems: list[str] = []
     if job.kerf_table not in profile.kerf_tables:
         problems.append(f'kerf_table: "{job.kerf_table}" is not a kerf table in the machine profile')
+    else:
+        table = profile.kerf_tables[job.kerf_table]
+        first, last = table.points[0][0], table.points[-1][0]
+        for i, (speed, _) in enumerate(job.kerf_extension):
+            if first <= speed <= last:
+                problems.append(
+                    f"kerf_extension[{i}]: speed {speed:g} mm/min is inside the range of kerf table "
+                    f'"{table.name}" ({first:g} to {last:g} mm/min); only speeds outside it may be added'
+                )
     for section in (job.root, job.tip):
         if not 0 < section.y < profile.wire_span:
             problems.append(
@@ -118,6 +127,13 @@ def fixed_points(outline: Outline, direction: str) -> tuple[list[int], list[str]
     return [m[0] for m in marks], [m[2] for m in marks]
 
 
+def extended(table: KerfTable, extension: tuple[tuple[float, float], ...]) -> KerfTable:
+    """§3 kerf_extension: the table with this job's extra points, for the lookup only."""
+    if not extension:
+        return table
+    return KerfTable(table.name, table.description, tuple(sorted(table.points + extension)))
+
+
 def corners(outline: Outline, direction: str) -> list[int]:
     """§10.2: positions in the traversal of the corners of the outer contour."""
     loop = traversal(outline, direction)[:-1]
@@ -161,7 +177,7 @@ class Cam:
         self.profile = profile
         self.root = root
         self.tip = tip
-        self.kerf = profile.kerf_tables[job.kerf_table]
+        self.kerf = extended(profile.kerf_tables[job.kerf_table], job.kerf_extension)
         self.kerf_used: dict[str, list[float]] = {"root": [], "tip": []}
         self.kerf_rounds: dict[str, int] = {}
         self.stretches: list[tuple[str, float, float]] = []  # (from to, root kerf, tip kerf)

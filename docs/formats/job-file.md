@@ -60,6 +60,7 @@ tip: { ... }
 | `version` | integer | yes | `1`. |
 | `name` | text | yes | Free name, written into G-code comments. Non-empty. |
 | `kerf_table` | text | yes | Name of a kerf table in the machine profile. |
+| `kerf_extension` | list | no | Extra kerf points for this job only, beyond the measured range of `kerf_table` (see **Kerf extension** below). Absent: none. |
 | `cut_speed` | number, mm/min | yes | Wire speed at the faster of the two foam faces during every feed move (§11). > 0. |
 | `direction` | text | yes | `"upper_first"` or `"lower_first"`. Order in which the outer contour is cut (§10.1). |
 | `max_segment_length` | number, mm | yes | Largest length of one move along the outer contour, at either foam face, measured along the kerf-compensated contour (§10.3). > 0. A value of 1.0 is suitable for wings. |
@@ -73,6 +74,23 @@ tip: { ... }
 | `tip` | section | yes | Second section (§4). |
 
 The names `root` and `tip` are labels only. Either may be nearer the left tower.
+
+**Kerf extension.** A kerf table holds measured values, and the lookup of
+machine-profile.md §7 never extrapolates. When a job needs a speed outside the
+table's range, the user may give the kerf there for this job only:
+
+```yaml
+kerf_extension:
+  - { speed: 120.0, kerf: 2.4 }
+```
+
+Each entry has `speed` (mm/min, > 0) and `kerf` (mm, > 0). Every speed must lie
+strictly below the table's first speed or strictly above its last, and no two
+entries may have the same speed. Otherwise the job is invalid. The CAM looks
+the kerf up in the table's points and these together, sorted by speed, by the
+lookup rule of machine-profile.md §7; a speed outside that combined range is
+still an error. The machine profile is not changed. The CAM report lists the
+entries as not measured.
 
 ## 4. Sections
 

@@ -32,6 +32,7 @@ def report(
         f"Job:          {job.name}",
         f"Profile:      {profile.name}",
         f"Kerf table:   {job.kerf_table}",
+        *[f"  + this job only, not measured: {speed:g} mm/min: {kerf:.3f} mm" for speed, kerf in job.kerf_extension],
         f"Cut speed:    {job.cut_speed:g} mm/min at the faster foam face",
         f"Direction:    {job.direction}",
         f"Mirror:       {'yes' if job.mirror else 'no'}",

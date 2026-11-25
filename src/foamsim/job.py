@@ -70,6 +70,7 @@ class Job:
     root: Section
     tip: Section
     channel_exit: float = 0.0  # 0: at cut_speed, RAPID: G0, else mm/min (job file 10.4)
+    kerf_extension: tuple[tuple[float, float], ...] = ()  # job file section 3: extra (speed, kerf) points
 
     @property
     def sections(self) -> tuple[Section, Section]:
@@ -91,7 +92,7 @@ def load_job(path: Path | str) -> Job:
 def parse_job(data: Any, base_dir: Path) -> Job:
     """Validate `data` (the loaded YAML). `.dat` paths are relative to `base_dir`."""
     c = Checker()
-    top = c.mapping(data, "", TOP_KEYS, ("channel_exit",))
+    top = c.mapping(data, "", TOP_KEYS, ("channel_exit", "kerf_extension"))
     if top is None:
         c.raise_if_any()
         raise AssertionError  # unreachable
@@ -118,6 +119,16 @@ def parse_job(data: Any, base_dir: Path) -> Job:
             c.error("channel_exit", 'must be "rapid" or a number > 0')
         else:
             channel_exit = float(raw_exit)
+
+    extension: list[tuple[float, float]] = []
+    for i, entry in enumerate(c.items(top, "kerf_extension", "") or []):
+        point = c.mapping(entry, f"kerf_extension[{i}]", ("speed", "kerf"))
+        speed = c.number(point, "speed", f"kerf_extension[{i}]", lambda v: v > 0, "> 0")
+        kerf = c.number(point, "kerf", f"kerf_extension[{i}]", lambda v: v > 0, "> 0")
+        if speed is not None and kerf is not None:
+            extension.append((speed, kerf))
+    if len({s for s, _ in extension}) != len(extension):
+        c.error("kerf_extension", "two entries have the same speed")
 
     safe: list[float] = []
     raw_safe = c.items(top, "safe_position", "")
@@ -167,6 +178,7 @@ def parse_job(data: Any, base_dir: Path) -> Job:
         root=root,
         tip=tip,
         channel_exit=channel_exit,
+        kerf_extension=tuple(sorted(extension)),
     )
 
 

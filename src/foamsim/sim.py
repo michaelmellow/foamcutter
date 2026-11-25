@@ -14,7 +14,7 @@ from .errors import GCodeError, InputError
 from .gcode import Motion, Program, parse_gcode
 from .geom import Arr, inside, polyline_distance
 from .job import RAPID, Job
-from .profile import Profile
+from .profile import KerfTable, Profile
 from .target import SectionTarget, build_targets
 from .wire import sweep_hits_block, trace, wire_angle, wire_in_box
 
@@ -194,6 +194,8 @@ def simulate(
     durations = [m.duration or 0.0 for m in cut]
     lines = [m.line for m in cut]
     table = profile.kerf_tables[job.kerf_table]
+    if job.kerf_extension:  # job file section 3: this job's points outside the measured range
+        table = KerfTable(table.name, table.description, tuple(sorted(table.points + job.kerf_extension)))
 
     traces = {name: trace(positions, span, target.y) for name, target in targets.items()}
     exits = _channel_exits(cut, traces, targets, table.max_kerf)

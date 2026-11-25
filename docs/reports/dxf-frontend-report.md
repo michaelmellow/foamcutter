@@ -1019,3 +1019,50 @@ higher cut speed or a kerf table measured down to about 100 mm/min.
 
 NOT verified: on the machine. Rounded corners drawn as several short edges,
 each turning less than 60 degrees, are not corners; they cut as before.
+
+## 21. Kerf beyond the measured range, for one job (owner's request, branch `sync-check`)
+
+Owner's request: when a speed is outside the kerf table, show the table as a
+graph with that speed and let the user choose the kerf there. Owner's choice
+(asked): for this job only, not saved to the machine profile.
+
+Format (docs/formats/job-file.md §3, new optional field `kerf_extension` and a
+"Kerf extension" paragraph): a list of `{ speed, kerf }`, both > 0, speeds
+distinct and strictly outside the table's range. The lookup uses the table's
+points and these together by the rule of machine-profile.md §7 (which still
+never extrapolates; machine-profile.md is unchanged). The CAM report lists
+each entry under the kerf table as "this job only, not measured".
+
+Built:
+- foamcam: job.py reads the field; cam.py validates it against the table and
+  looks up in the combined points (`extended`); output.py reports it.
+- foamsim (on its own, as before): job.py reads it, target.py checks it lies
+  outside the table, sim.py uses the combined points.
+- foamdxf/kerfext.py: parsing the CAM's out-of-range message, the suggested
+  point (10 % beyond the speed the cut needs, rounded to 5 mm/min, on the
+  straight line through the two measured points nearest that end, never below
+  0.05 mm), and the dialog: the measured points over a shaded "measured"
+  band, a red line at the speed the cut needs, the CAM's "why" sentence, and
+  an orange point to drag or type. It refuses a point inside the table, one
+  that does not reach the needed speed, or a kerf of 0. A new point replaces
+  an earlier one on the same side of the table.
+- gui.py: when Preview fails on a speed outside the selected table, the dialog
+  opens; "Use for this job" keeps the point and previews again. The point is
+  kept in the form (with the table's name, so picking another table drops it)
+  and shown in orange under the Cut fields with a Clear button. It is saved
+  in projects and the settings like the other form values; jobgen writes it
+  into the job.
+
+Verified: tests/dxf/test_kerfext.py (message parsing, the suggested point at
+both ends, the form text, replacing a point, the dialog's refusals and
+dragging, the CAM refusing then cutting a fast tapered-spar job with an
+extension and reporting it, an extension inside the table refused, and
+Preview in the window: cancel keeps nothing, accept cuts and shows the row,
+Clear hides it); tests/sim/test_kerf_extension.py. check.py cam and dxf
+pass; sim has the same 19 failures as before. Screenshot of the dialog for
+the ElectronicsPlane wing at 250 mm/min (needs 147, table from 167).
+
+NOT verified: on the machine. A point beyond the table is a guess; the
+dialog and the report say so. Only the first out-of-range speed of a
+Preview is offered; a second one (the other end) comes up at the next
+Preview.

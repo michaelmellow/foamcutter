@@ -42,6 +42,14 @@ from .holes import (
     specs_to_text,
 )
 from .jobgen import CutSettings, Placement
+from .kerfext import (
+    ExtensionDialog,
+    OutOfRange,
+    extension_from_text,
+    extension_to_text,
+    merged,
+    out_of_range,
+)
 from .kerftab import KerfPanel
 from .machine import (
     MOUSE_FEED_FALLBACK_MAX,
@@ -121,6 +129,7 @@ DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": st
 DEFAULTS |= {"channel": "shortest"}  # side the wire enters inner contours (holes) from
 # how the wire leaves a hole's channel ("rapid", "cut" or mm/min), and the drawn channels (JSON, holes.py)
 DEFAULTS |= {"channel_exit": "rapid", "channels": ""}
+DEFAULTS |= {"kerf_extension": ""}  # kerf points beyond the table's range, this job only (kerfext.py)
 # STEP workflow: source "step" uses the model and two of its flat faces (numbers) instead of the DXFs
 DEFAULTS |= {"source": "dxf", "step": "", "root_face": "", "tip_face": ""}
 # which stock values were typed last ("absolute" or "margin"): kept when the outlines change
@@ -215,9 +224,11 @@ def request_from_form(values: dict[str, str]) -> Request:
         channels = specs_from_text(values.get("channels", ""))
     except DxfError as error:
         raise FormError(f"Hole channels: {error}") from None
+    kerf_table = values.get("kerf_table", "").strip() or None
     settings = CutSettings(
         cut_speed=req("speed", labels["speed"]),
-        kerf_table=values.get("kerf_table", "").strip() or None,
+        kerf_table=kerf_table,
+        kerf_extension=extension_from_text(values.get("kerf_extension", ""), kerf_table),
         direction=values.get("direction", "upper_first"),
         max_segment_length=req("segment", labels["segment"]),
         min_te_thickness=req("min_te", labels["min_te"]),
@@ -553,6 +564,17 @@ class SlicerWindow:
         ttk.Entry(cut, textvariable=self.vars["channel_exit"], width=10).grid(row=3, column=1, sticky="we", padx=4)
         ttk.Label(cut, text="rapid, cut or mm/min", foreground="#5f6368").grid(row=3, column=2, sticky="w")
         self._number_rows(cut, CUT_FIELDS, first_row=4)
+        # kerf points beyond the table's range, chosen at Preview for this job only (kerfext.py)
+        self.extension_row = ttk.Frame(cut)
+        self.extension_row.grid(row=4 + len(CUT_FIELDS), column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self.extension_text = tk.StringVar()
+        ttk.Label(self.extension_row, textvariable=self.extension_text, foreground="#e37400", wraplength=260,
+                  justify="left").pack(side=tk.LEFT)
+        ttk.Button(self.extension_row, text="Clear", width=6,
+                   command=lambda: self.vars["kerf_extension"].set("")).pack(side=tk.LEFT, padx=(6, 0))
+        for key in ("kerf_extension", "kerf_table"):
+            self.vars[key].trace_add("write", lambda *_: self._show_extension())
+        self._show_extension()
 
         out = ttk.LabelFrame(form, text="Output", padding=6)
         out.pack(fill=tk.X, pady=(8, 0))
@@ -1038,6 +1060,39 @@ class SlicerWindow:
             "  - the work zero is the one this job was made for")):
             self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
 
+    def _show_extension(self) -> None:
+        points = extension_from_text(self.vars["kerf_extension"].get(), self.vars["kerf_table"].get().strip() or None)
+        if points:
+            self.extension_text.set("Kerf beyond the table, this job only (not measured): " + ", ".join(
+                f"{s:g} mm/min {k:.3f} mm" for s, k in points))
+            self.extension_row.grid()
+        else:
+            self.extension_row.grid_remove()
+
+    def ask_extension(self, table: list[tuple[float, float]], existing: tuple[tuple[float, float], ...],
+                      need: OutOfRange) -> tuple[float, float] | None:
+        """The dialog with the kerf graph (a method, so tests can answer it)."""
+        return ExtensionDialog(self.root, table, existing, need).wait()
+
+    def _offer_kerf_extension(self, error: Exception) -> bool:
+        """After the CAM refused a speed outside the selected kerf table: show the table and
+        let the user place a point beyond it for this job, then Preview again."""
+        need = out_of_range(str(error)) if isinstance(error, FoamcamError) else None
+        profile = self._profile()
+        if need is None or profile is None or need.table != self.vars["kerf_table"].get().strip():
+            return False
+        table = profile.kerf_tables.get(need.table)
+        if table is None:
+            return False
+        self.root.configure(cursor="")
+        existing = extension_from_text(self.vars["kerf_extension"].get(), need.table)
+        point = self.ask_extension(list(table.points), existing, need)
+        if point is None:
+            self.status.set("Error: " + str(error).splitlines()[0] + "  (no kerf chosen beyond the table)")
+            return False
+        self.vars["kerf_extension"].set(extension_to_text(need.table, merged(existing, point, table.points[0][0])))
+        return self.preview()
+
     def _profile(self) -> Profile | None:
         """The machine profile in the form (read again when the file changes), or None."""
         path = Path(self.vars["profile"].get().strip())
@@ -1190,7 +1245,7 @@ class SlicerWindow:
             self.wire_label.set("")
             self._update_readout(0)
             self.machine.refresh()
-            return False
+            return not quiet and self._offer_kerf_extension(error)
         finally:
             self.root.configure(cursor="")
         self._show_report(self._plan_text() + "\n" + self.result.report)

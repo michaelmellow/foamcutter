@@ -236,6 +236,12 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
     errors: list[str] = []
     if job.kerf_table not in profile.kerf_tables:
         errors.append(f'kerf_table: "{job.kerf_table}" is not a table of the machine profile')
+    else:
+        points = profile.kerf_tables[job.kerf_table].points
+        low, high = points[0][0], points[-1][0]
+        for i, (speed, _) in enumerate(job.kerf_extension):
+            if low <= speed <= high:
+                errors.append(f"kerf_extension[{i}]: speed {speed:g} mm/min is inside the table range {low:g} to {high:g}")
     span = profile.wire_span
     targets: dict[str, SectionTarget] = {}
     order: dict[str, list[str]] = {}

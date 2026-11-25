@@ -66,6 +66,7 @@ class Job:
     root: Section
     tip: Section
     channel_exit: float = 0.0  # §10.4: 0 = at cut_speed, RAPID = G0, else mm/min at the faster face
+    kerf_extension: tuple[tuple[float, float], ...] = ()  # §3: (speed, kerf), this job only, not measured
 
 
 TOP_FIELDS = {
@@ -85,7 +86,7 @@ def load_job_text(text: str, base_dir: Path | str) -> Job:
 
 def parse_job(data: Any, base_dir: Path) -> Job:
     r = Reader()
-    top = r.mapping(data, "", TOP_FIELDS, frozenset({"channel_exit"}))
+    top = r.mapping(data, "", TOP_FIELDS, frozenset({"channel_exit", "kerf_extension"}))
     if "format" in top and top["format"] != "foamcutter-job":
         r.problem("format", 'must be "foamcutter-job"')
     r.integer(top, "version", "", equal=1)
@@ -125,9 +126,27 @@ def parse_job(data: Any, base_dir: Path) -> Job:
         root=root if root is not None else empty_section("root"),
         tip=tip if tip is not None else empty_section("tip"),
         channel_exit=read_channel_exit(r, top),
+        kerf_extension=read_kerf_extension(r, top),
     )
     r.raise_if_problems(WHAT)
     return job
+
+
+def read_kerf_extension(r: Reader, top: dict[str, Any]) -> tuple[tuple[float, float], ...]:
+    """§3 kerf_extension: (speed, kerf) pairs, both > 0, speeds distinct. Whether they lie
+    outside the table's range needs the profile: checked by the CAM's validation."""
+    if "kerf_extension" not in top:
+        return ()
+    points: list[tuple[float, float]] = []
+    for i, item in enumerate(r.sequence(top, "kerf_extension", "")):
+        where = f"kerf_extension[{i}]"
+        entry = r.mapping(item, where, {"speed", "kerf"})
+        if "speed" in entry and "kerf" in entry:
+            points.append((r.number(entry, "speed", where, gt=0), r.number(entry, "kerf", where, gt=0)))
+    speeds = [s for s, _ in points]
+    if len(set(speeds)) != len(speeds):
+        r.problem("kerf_extension", "two entries have the same speed")
+    return tuple(sorted(points))
 
 
 def read_channel_exit(r: Reader, top: dict[str, Any]) -> float:

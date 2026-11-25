@@ -54,6 +54,8 @@ class CutSettings:
     # how the wire leaves a hole's channel (job-file.md §10.4): "rapid", "cut" (at cut_speed,
     # field left out) or a speed in mm/min
     channel_exit: str | float = "rapid"
+    # (speed, kerf) for this job only, outside the kerf table's measured range (job-file.md §3)
+    kerf_extension: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +144,8 @@ def build_job(
         "version: 1",
         f"name: {_quote(title)}",
         f"kerf_table: {_quote(kerf_table)}",
+        *(["kerf_extension:  # this job only, not measured"] if settings.kerf_extension else []),
+        *[f"  - {{ speed: {_num(s)}, kerf: {_num(k)} }}" for s, k in settings.kerf_extension],
         f"cut_speed: {_num(settings.cut_speed)}",
         f"direction: {_quote(settings.direction)}",
         f"max_segment_length: {_num(settings.max_segment_length)}",
@@ -180,7 +184,10 @@ def build_job(
         + (f"into {h.into} (cut from inside it), " if h.into else f"from the {h.slit} side, ") +
         f"{h.channel_lengths[0]:.1f} mm (root) / {h.channel_lengths[1]:.1f} mm (tip) long"
         for h in holes
-    ) + ((f"channel exit: {_exit_text(settings.channel_exit, settings.cut_speed)}",) if holes else ())
+    ) + ((f"channel exit: {_exit_text(settings.channel_exit, settings.cut_speed)}",) if holes else ()) + tuple(
+        f"kerf table extended for this job (not measured): {s:g} mm/min, {k:.3f} mm"
+        for s, k in settings.kerf_extension
+    )
     return GeneratedJob("\n".join(lines) + "\n", summary, tuple(holes), (dx, dz), (root.points, tip.points))
 
 
