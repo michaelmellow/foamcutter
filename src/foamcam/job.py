@@ -44,6 +44,11 @@ class Block:
     x: float
     length: float
     height: float
+    z: float | None = None  # bottom face; None = on the table (§5)
+
+    def bottom(self, table_z: float) -> float:
+        """G54 z of the bottom face: `z`, else the table top."""
+        return table_z if self.z is None else self.z
 
 
 @dataclass(frozen=True)
@@ -93,11 +98,12 @@ def parse_job(data: Any, base_dir: Path) -> Job:
         safe.append(r.number_value(value, f"safe_position[{i}]"))
     safe += [0.0] * (4 - len(safe))
 
-    block_data = r.mapping(top.get("block"), "block", {"x", "length", "height"}) if "block" in top else {}
+    block_data = r.mapping(top.get("block"), "block", {"x", "length", "height"}, frozenset({"z"})) if "block" in top else {}
     block = Block(
         r.number(block_data, "x", "block"),
         r.number(block_data, "length", "block", gt=0),
         r.number(block_data, "height", "block", gt=0),
+        r.number(block_data, "z", "block") if "z" in block_data else None,
     )
 
     root = read_section(r, top.get("root"), "root", base_dir) if "root" in top else None

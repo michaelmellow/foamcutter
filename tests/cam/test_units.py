@@ -526,3 +526,16 @@ def test_rapids_never_move_diagonally(tmp_path: Path, safe: list[float]) -> None
         position.update(values)
         previous_command = words[0]
     assert previous_command == "G0"
+
+
+def test_out_of_table_speed_names_the_slow_stretch(tmp_path: Path) -> None:
+    """After the exact lookup message, a second line says which stretch is that slow and
+    its length at both faces (both faces take the same time over a stretch)."""
+    with pytest.raises(CamError) as caught:
+        run(tmp_path, wing_job(cut_speed=600.0))
+    problems = caught.value.problems
+    first = next(i for i, p in enumerate(problems) if "outside the table range" in p)
+    why = problems[first + 1]
+    assert re.fullmatch(r"why: the outer contour from .+ to .+ is \d+\.\d mm long at the root and \d+\.\d mm "
+                        r"at the tip; both faces take the same time over it, so the (root|tip) face moves at "
+                        r"only \d+ mm/min there", why), why

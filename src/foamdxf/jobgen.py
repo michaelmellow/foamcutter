@@ -9,7 +9,8 @@ Placement rules:
 - **In the section plane (x, z).** Both DXFs are drawn in one coordinate frame,
   so sweep, dihedral and twist are whatever the drawings show. The bounding box
   of both outlines together is centred in the stock (length along x, height
-  along z). The stock rests on the table (`z = table_z`).
+  along z). The stock rests on the table (`z = table_z`) unless `block_z` puts
+  its bottom face elsewhere, e.g. on a part of a larger block (job-file.md §5).
 - **Stock on the table (x).** By default the stock plus the lead-in is centred
   in the travel shared by axes 1 and 3. `block_x` overrides this.
 
@@ -38,6 +39,7 @@ class Placement:
     block_x: float | None = None  # G54 x of the stock's back face; None = centred in travel
     lead_in: float = 20.0  # mm in front of the stock
     safe_clearance: float = 20.0  # mm above the stock for the safe position
+    block_z: float | None = None  # G54 z of the stock's bottom face; None = on the table
 
 
 @dataclass(frozen=True)
@@ -118,12 +120,13 @@ def build_job(
     else:
         block_x = placement.block_x
     dx = block_x + (placement.stock_length - width) / 2 - xmin
-    dz = profile.table_z + (placement.stock_height - height) / 2 - zmin
+    z0 = profile.table_z if placement.block_z is None else placement.block_z
+    dz = z0 + (placement.stock_height - height) / 2 - zmin
 
     y_root = (profile.wire_span - span) / 2
     y_tip = y_root + span
     x_entry = block_x + placement.stock_length + placement.lead_in
-    z_safe = profile.table_z + placement.stock_height + placement.safe_clearance
+    z_safe = z0 + placement.stock_height + placement.safe_clearance
 
     title = name or f"{root.source} to {tip.source}, span {span:g} mm"
     lines = [
@@ -131,7 +134,8 @@ def build_job(
         "# Regenerate from the source files instead of editing the shapes by hand.",
         (
             f"# Stock {placement.stock_length:g} x {placement.stock_height:g} mm, back face at x = {_num(block_x)}, "
-            f"on the table at z = {_num(profile.table_z)}."
+            + (f"on the table at z = {_num(profile.table_z)}." if placement.block_z is None
+             else f"bottom face at z = {_num(z0)} (table at z = {_num(profile.table_z)}).")
         ),
         f"# Section planes y = {_num(y_root)} and y = {_num(y_tip)}, centred between the towers.",
         'format: "foamcutter-job"',
@@ -148,7 +152,8 @@ def build_job(
         *exit_line,
         (
             f"block: {{ x: {_num(block_x)}, length: {_num(placement.stock_length)}, "
-            f"height: {_num(placement.stock_height)} }}"
+            f"height: {_num(placement.stock_height)}"
+            + ("" if placement.block_z is None else f", z: {_num(placement.block_z)}") + " }"
         ),
     ]
     lines += _section("root", root, dx, dz, y_root, [(h.name, h.slit, h.root, h.root_channel) for h in holes])
@@ -163,6 +168,7 @@ def build_job(
         (
             f"stock back face x = {block_x:.1f}, front face x = {block_x + placement.stock_length:.1f}, "
             f"entry x = {x_entry:.1f}"
+            + ("" if placement.block_z is None else f", bottom face z = {z0:.1f}")
         ),
         (
             f"section planes y = {y_root:.1f} (root) and {y_tip:.1f} (tip), span {span:g} mm, "

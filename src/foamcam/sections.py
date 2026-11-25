@@ -287,11 +287,11 @@ def channel_problem(
     return ""
 
 
-def check_in_block(outline: Outline, block: Block, table_z: float, problems: list[str]) -> None:
-    """§6.7: every target point inside the block's x and z range (§5)."""
+def check_in_block(outline: Outline, block: Block, z0: float, problems: list[str]) -> None:
+    """§6.7: every target point inside the block's x and z range (§5), bottom face at `z0`."""
     worst = 0.0
     for p in outline.contour:
         x, z = outline.place(p)
-        worst = max(worst, block.x - x, x - (block.x + block.length), table_z - z, z - (table_z + block.height))
+        worst = max(worst, block.x - x, x - (block.x + block.length), z0 - z, z - (z0 + block.height))
     if worst > 1e-9:
         problems.append(f"{outline.section.label}: the section lies outside the block by up to {worst:.3f} mm")

@@ -7,11 +7,18 @@ import pytest
 pytest.importorskip("ezdxf")
 
 import tkinter as tk
-from tkinter import ttk
 
 from foamdxf import gui
 from foamdxf.gui import FormError, SlicerWindow, request_from_form
-from foamdxf.pipeline import alignment_edges, make_job, preview_geometry, run_cam
+from foamdxf.pipeline import (
+    CORNERS,
+    alignment_edges,
+    block_at_corner,
+    make_job,
+    preview_geometry,
+    run_cam,
+)
+from foamdxf.sender import Status
 from foamdxf.view3d import Camera
 
 REPO = Path(__file__).resolve().parents[2]
@@ -152,22 +159,107 @@ def test_alignment_edges_put_the_wire_on_the_stock_edges() -> None:
     assert safe[1] > z1 and safe[3] > z1  # crossing happens above the stock
 
 
-def test_align_tab_copies_and_shows_an_edge(window: SlicerWindow, tmp_path: Path) -> None:
+def live_status(tower_12: tuple[float, float], tower_34: tuple[float, float]) -> Status:
+    """A status report for real-machine.yaml: axis 1-2 tower = Z/A, axis 3-4 tower = X/Y,
+    positions in controller order X Y Z A."""
+    wpos = (tower_34[0], tower_34[1], tower_12[0], tower_12[1])
+    return Status("Idle", wpos, wpos, 0.0, None, "")
+
+
+def test_block_at_corner_puts_that_corner_on_the_wire() -> None:
+    wire = (150.0, 70.0)
+    for key, (_, front, top) in CORNERS.items():
+        x, z = block_at_corner(key, wire, 220.0, 40.0)
+        assert (x + (220.0 if front else 0.0), z + (40.0 if top else 0.0)) == pytest.approx(wire)
+    assert block_at_corner("front_top", wire, 220.0, 40.0) == pytest.approx((-70.0, 30.0))
+
+
+def test_form_block_z_is_optional() -> None:
+    assert request_from_form(form(block_z="")).placement.block_z is None
+    assert request_from_form(form(block_z="12,5")).placement.block_z == 12.5
+    with pytest.raises(FormError, match="Stock bottom face z: not a number"):
+        request_from_form(form(block_z="low"))
+
+
+def test_stock_tab_and_3d_view_are_in_the_machine_tab(window: SlicerWindow, tmp_path: Path) -> None:
+    tab_names = [window.tabs.tab(t, "text") for t in window.tabs.tabs()]  # type: ignore[no-untyped-call]
+    assert tab_names == ["Machine", "Report"]  # no separate 3D or Align stock tab
+    m = window.machine
+    assert str(window.stock_pane) in m.controls.tabs()  # type: ignore[no-untyped-call] # beside Program, Jog, Home, Kerf
+    panes = window.machine_tab.panes()  # type: ignore[no-untyped-call]
+    assert panes == (str(window.frame3d), str(m))  # 3D on the left, full height
     for key, value in form(out=str(tmp_path / "out")).items():
         window.vars[key].set(value)
     assert window.preview()
-    buttons = [w for w in window.align_frame.winfo_children() if isinstance(w, ttk.Button)]
-    assert [b.cget("text") for b in buttons] == ["Copy G-code", "Show in 3D", "Go there"] * 4
-    buttons[0].invoke()
     g = window.geometry
     assert g is not None
-    edge = alignment_edges(g)[0]
+    edges = {e.corner: e for e in alignment_edges(g)}
+    assert set(edges) == set(CORNERS)
+    window.stock_corner.set("back_top")
+    window._corner_changed()
+    edge = edges["back_top"]
+    assert window.view3d.highlight is not None and window.view3d.highlight[:2] == (edge.x, edge.z)
+    window._copy_corner()
     assert window.root.clipboard_get() == "\n".join(edge.gcode)
-    assert edge.gcode[0] in window.align_text.get("1.0", tk.END)
-    buttons[1].invoke()
-    assert window.view3d.highlight == (edge.x, edge.z, edge.name)
-    window.preview()  # a new preview clears the highlight
-    assert window.view3d.highlight is None
+    assert edge.gcode[0] in window.status.get()
+    window.preview()  # a new preview keeps the picked corner
+    assert window.view3d.highlight is not None and window.view3d.highlight[:2] == (edge.x, edge.z)
+
+
+def test_clicking_a_stock_edge_in_3d_picks_its_corner(window: SlicerWindow, tmp_path: Path) -> None:
+    for key, value in form(out=str(tmp_path / "out")).items():
+        window.vars[key].set(value)
+    assert window.preview()
+    v, g = window.view3d, window.geometry
+    assert g is not None
+    centre, scale = v._frame()
+    w, h = v._size()
+    _, _, x1, z1 = g.stock
+    mid = (x1, (g.root_y + g.tip_y) / 2, z1)  # middle of the front top edge
+    cx, cy = v.camera.project(mid, centre, scale, w, h)
+    assert v.edge_at(cx, cy) == "front_top"
+    assert v.edge_at(cx + 200, cy + 200) is None
+    window._pick_corner("back_bottom")
+    assert window.stock_corner.get() == "back_bottom"
+
+
+def test_live_wire_is_drawn_and_places_the_stock(window: SlicerWindow, tmp_path: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    for key, value in form(out=str(tmp_path / "out")).items():
+        window.vars[key].set(value)
+    assert window.preview()
+    warnings: list[str] = []
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda title, *a, **k: warnings.append(title))
+
+    window._corner_at_wire()  # not connected
+    assert warnings == ["No wire position"]
+
+    window._live_status(live_status((120.0, 90.0), (121.0, 90.0)))  # towers 1 mm apart
+    assert window.view3d.live == ((120.0, 90.0), (121.0, 90.0))
+    assert "towers differ" in window.stock_wire_text.get()
+    window._corner_at_wire()
+    assert warnings[-1] == "Wire not along the edge"
+
+    # a second part from the same block: on top of the first stock, front corners level
+    window._live_status(live_status((260.0, 80.0), (260.0, 80.0)))
+    assert window.stock_wire_text.get().startswith("Z 260.000  A 80.000")
+    window.stock_corner.set("front_bottom")
+    window._corner_at_wire()
+    assert (window.vars["block_x"].get(), window.vars["block_z"].get()) == ("40", "80")
+    g = window.geometry
+    assert g is not None and window.plan is not None  # previewed again with the new place
+    assert g.stock == pytest.approx((40.0, 80.0, 260.0, 120.0))
+    assert window.plan.job.block.z == 80.0
+    assert min(g.safe_position[1], g.safe_position[3]) > 120.0  # the safe height is above the moved stock
+
+    window.stock_corner.set("front_top")  # the top at z = 30 puts the bottom under the table
+    window._live_status(live_status((260.0, 30.0), (260.0, 30.0)))
+    window._corner_at_wire()
+    assert warnings[-1] == "Below the table"
+    assert window.vars["block_z"].get() == "80"  # unchanged
+
+    window._live_status(None)
+    assert window.view3d.live is None
 
 
 def test_stock_margins_follow_the_absolute_values(window: SlicerWindow) -> None:

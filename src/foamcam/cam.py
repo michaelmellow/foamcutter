@@ -72,7 +72,7 @@ def validate(job: Job, profile: Profile) -> tuple[Outline, Outline]:
     tip = build_outline(job.tip, job.min_te_thickness, problems)
     for outline in (root, tip):
         if outline is not None:
-            check_in_block(outline, job.block, profile.table_z, problems)
+            check_in_block(outline, job.block, job.block.bottom(profile.table_z), problems)
     if (
         root is not None
         and tip is not None
@@ -127,6 +127,7 @@ class Cam:
         self.kerf_rounds: dict[str, int] = {}
         self.stretches: list[tuple[str, float, float]] = []  # (from to, root kerf, tip kerf)
         self.problems: list[str] = []
+        self.slow_parts: dict[str, str] = {}  # out-of-table lookup message -> the part of the cut that is slow
 
     # --- §10.7 kerf compensation and §10.3 synchronisation ----------------
 
@@ -172,7 +173,8 @@ class Cam:
         )
         groups_r = [list(range(a, b)) for a, b in pairwise(pos_r)]
         groups_t = [list(range(a, b)) for a, b in pairwise(pos_t)]
-        new_r, new_t, half_r, half_t = self.settle("outer contour", poly_r, poly_t, groups_r, groups_t, True)
+        names = [f"from {labels[k]} to {labels[k + 1]}" for k in range(len(groups_r))]
+        new_r, new_t, half_r, half_t = self.settle("outer contour", poly_r, poly_t, groups_r, groups_t, True, names)
         self.stretches = [
             (f"{labels[k]} to {labels[k + 1]}", 2 * hr, 2 * ht) for k, (hr, ht) in enumerate(zip(half_r, half_t))
         ]
@@ -196,6 +198,7 @@ class Cam:
         groups_r: list[list[int]],
         groups_t: list[list[int]],
         outward: bool,
+        names: list[str] | None = None,
     ) -> tuple[list[Point], list[Point], list[float], list[float]]:
         """Offset two placed polygons, iterating the kerf of each group of edges (§10.7).
 
@@ -212,11 +215,11 @@ class Cam:
 
         # First lookup from the speeds of the uncompensated path. During the
         # iteration a speed outside the kerf table takes the nearer table end.
-        half_r, half_t = self.group_halves(poly_r, poly_t, groups_r, groups_t, [])
+        half_r, half_t = self.group_halves(poly_r, poly_t, groups_r, groups_t, [], where, names)
         for rounds in range(1, KERF_ROUNDS + 1):
             new_r, new_t = offsets(half_r, half_t)
             out_of_table: list[str] = []  # only the settled lookup counts
-            next_r, next_t = self.group_halves(new_r, new_t, groups_r, groups_t, out_of_table)
+            next_r, next_t = self.group_halves(new_r, new_t, groups_r, groups_t, out_of_table, where, names)
             change = max(abs(a - b) for a, b in zip(half_r + half_t, next_r + next_t))
             if change <= KERF_SETTLED:
                 break
@@ -231,6 +234,8 @@ class Cam:
             # The settled lookup is outside the table: reported with the other
             # checks, and the program is not written.
             self.problems.append(out_of_table[0])
+            if out_of_table[0] in self.slow_parts:
+                self.problems.append(self.slow_parts[out_of_table[0]])
         for label, half in (("root", half_r), ("tip", half_t)):
             self.kerf_used[label] += [2 * h for h in half if h > 0]
         return new_r, new_t, half_r, half_t
@@ -242,6 +247,8 @@ class Cam:
         groups_r: list[list[int]],
         groups_t: list[list[int]],
         out_of_table: list[str],
+        where: str = "",
+        names: list[str] | None = None,
     ) -> tuple[list[float], list[float]]:
         """Half the kerf of each group at each face, from the speed of its moves there.
 
@@ -252,12 +259,20 @@ class Cam:
         """
         half_r: list[float] = []
         half_t: list[float] = []
-        for group_r, group_t in zip(groups_r, groups_t):
+        for k, (group_r, group_t) in enumerate(zip(groups_r, groups_t)):
             dr = sum(g.dist(poly_r[i], poly_r[(i + 1) % len(poly_r)]) for i in group_r)
             dt = sum(g.dist(poly_t[i], poly_t[(i + 1) % len(poly_t)]) for i in group_t)
             fastest = max(dr, dt)
-            for d, half in ((dr, half_r), (dt, half_t)):
-                half.append(0.0 if d <= g.EPS else self.lookup(self.job.cut_speed * d / fastest, out_of_table) / 2)
+            for face, d, half in (("root", dr, half_r), ("tip", dt, half_t)):
+                found: list[str] = []
+                half.append(0.0 if d <= g.EPS else self.lookup(self.job.cut_speed * d / fastest, found) / 2)
+                if found:  # the exact lookup message (machine-profile.md §7), then where and why
+                    part = f"{where} {names[k]}" if names else f"{where} edge {k}"
+                    out_of_table.append(found[0])
+                    self.slow_parts.setdefault(found[0], (
+                        f"why: the {part} is {dr:.1f} mm long at the root and {dt:.1f} mm at the tip; both faces "
+                        f"take the same time over it, so the {face} face moves at only "
+                        f"{self.job.cut_speed * d / fastest:.0f} mm/min there"))
         return half_r, half_t
 
     def lookup(self, speed: float, out_of_table: list[str]) -> float:
@@ -486,7 +501,8 @@ class Cam:
                 self.problems.append(f"the rapid move {what} passes through the foam block")
 
     def rapid_hits_block(self, start: Axes, end: Axes) -> bool:
-        block, span, z0 = self.job.block, self.profile.wire_span, self.profile.table_z
+        block, span = self.job.block, self.profile.wire_span
+        z0 = block.bottom(self.profile.table_z)
         y_lo, y_hi = sorted((self.job.root.y, self.job.tip.y))
         planes = 100
         for j in range(planes + 1):

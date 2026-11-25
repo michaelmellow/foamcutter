@@ -119,17 +119,21 @@ block: { x: 100.0, length: 300.0, height: 60.0 }
 | `x` | number, mm | yes | Work-frame `x` of the block's back face (its smallest `x`). |
 | `length` | number, mm | yes | Block size along `x`. > 0. |
 | `height` | number, mm | yes | Block size along `z`. > 0. |
+| `z` | number, mm | no | Work-frame `z` of the block's bottom face. Default: `table_z`. |
 
 The block is a rectangular box occupying
 
 ```text
 x from block.x            to block.x + block.length
 y from min(root.y, tip.y) to max(root.y, tip.y)
-z from table_z            to table_z + block.height
+z from z0                 to z0 + block.height
 ```
 
-where `table_z` is the G54 `z` of the table top, from the machine profile
-(machine profile §3.4). The block rests on the table.
+where `z0` is `block.z` if given, else `table_z`, the G54 `z` of the table top
+from the machine profile (machine profile §3.4). Without `z` the block rests on
+the table. With `z` the block may be a part of a larger block, for example the
+next layer of a stack of parts cut from one block; the CAM then knows only this
+part, not the foam around it (§10.6).
 **The block's two end faces
 are the two section planes.** These two faces are the **foam faces**. Wire speeds
 "at the foam" always mean speeds at these two planes. (If the real block is
@@ -474,8 +478,9 @@ given in the text report instead.
 The program starts with a rapid move to `safe_position`, then a rapid move to
 the entry points. It ends with a rapid move from the entry points back to
 `safe_position`. The CAM rejects the job if either rapid move would pass
-through the block (§5, from `z = table_z`) at any plane between the two foam
-faces.
+through the block (§5, from `z = z0`) at any plane between the two foam
+faces. Foam outside the block (§5) is not checked: when the block is part of a larger
+block, the operator must make sure the rapid moves and the lead-in are clear of it.
 
 Before running the program the operator must make sure the wire can travel in
 a straight line from where it is to `safe_position` without touching foam.

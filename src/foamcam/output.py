@@ -38,7 +38,7 @@ def report(
         "Foam block (G54, mm)",
         f"  x {job.block.x:.3f} to {job.block.x + job.block.length:.3f}",
         f"  y {min(job.root.y, job.tip.y):.3f} to {max(job.root.y, job.tip.y):.3f} (foam faces: root y = {job.root.y:g}, tip y = {job.tip.y:g})",
-        f"  z {profile.table_z:.3f} to {profile.table_z + job.block.height:.3f}",
+        f"  z {job.block.bottom(profile.table_z):.3f} to {job.block.bottom(profile.table_z) + job.block.height:.3f}",
         "",
         "Travel used (G54, mm)",
     ]
@@ -107,7 +107,7 @@ def preview_svg(
     refs: "list[Ref]",
 ) -> str:
     """Front view (x right, z up) of block, target sections and wire paths at both faces."""
-    block, z0_block = job.block, profile.table_z
+    block, z0_block = job.block, job.block.bottom(profile.table_z)
     x_entry = block.x + block.length + job.lead_in
     xs = [block.x, x_entry]
     zs = [z0_block, z0_block + block.height]

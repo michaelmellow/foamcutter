@@ -76,6 +76,7 @@ def parser() -> argparse.ArgumentParser:
                         "(at the cut speed) or a speed in mm/min")
     p.add_argument("--lead-in", type=float, default=20.0, help="clearance in front of the stock, mm (default 20)")
     p.add_argument("--block-x", type=float, help="G54 x of the stock's back face (default: centred in travel)")
+    p.add_argument("--block-z", type=float, help="G54 z of the stock's bottom face (default: on the table)")
     p.add_argument("--safe-clearance", type=float, default=20.0,
                    help="safe position height above the stock, mm (default 20)")
     p.add_argument("--min-te", type=float, default=0.6,
@@ -130,7 +131,7 @@ def main(argv: list[str] | None = None) -> int:
         tip=tip,
         profile=args.profile,
         placement=Placement(args.span or 0.0, args.stock[0], args.stock[1], args.block_x, args.lead_in,
-                            args.safe_clearance),
+                            args.safe_clearance, args.block_z),
         settings=CutSettings(args.speed, args.kerf_table, args.direction, args.segment, args.min_te, args.channel,
                              channel_exit=args.channel_exit),
         name=args.name,

@@ -53,6 +53,7 @@ class Block:
     x: float
     length: float
     height: float
+    z: float = 0.0  # bottom face (job-file.md §5); the simulator takes the table at z = 0
 
 
 @dataclass(frozen=True)
@@ -129,12 +130,13 @@ def parse_job(data: Any, base_dir: Path) -> Job:
                 safe.append(n)
 
     block = None
-    b = c.mapping(top.get("block"), "block", ("x", "length", "height")) if "block" in top else None
+    b = c.mapping(top.get("block"), "block", ("x", "length", "height"), ("z",)) if "block" in top else None
     bx = c.number(b, "x", "block")
     bl = c.number(b, "length", "block", lambda v: v > 0, "> 0")
     bh = c.number(b, "height", "block", lambda v: v > 0, "> 0")
-    if bx is not None and bl is not None and bh is not None:
-        block = Block(bx, bl, bh)
+    bz = c.number(b, "z", "block") if b is not None and "z" in b else 0.0
+    if bx is not None and bl is not None and bh is not None and bz is not None:
+        block = Block(bx, bl, bh, bz)
 
     sections = {
         label: _parse_section(c, top.get(label), label, base_dir)

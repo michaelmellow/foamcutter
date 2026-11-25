@@ -260,6 +260,21 @@ def test_block_x_default_is_centred_in_travel_and_can_be_set(tmp_path: Path, pro
     assert job.block.x == 50.0
 
 
+def test_block_z_raises_the_stock_off_the_table(tmp_path: Path, profile: Profile) -> None:
+    """job-file.md §5: with block_z the stock's bottom face is there, not on the table; the
+    outlines stay centred in it and the safe height is above it."""
+    plain = make_job(tmp_path, profile, stock=(300.0, 80.0))[0]
+    on_table = load_job_text(plain, tmp_path)
+    text = make_job(tmp_path, profile, stock=(300.0, 80.0), block_z=profile.table_z + 50.0)[0]
+    raised = load_job_text(text, tmp_path)
+    assert on_table.block.z is None and "z:" not in plain.split("block:")[1].splitlines()[0]
+    assert raised.block.z == profile.table_z + 50.0
+    assert raised.root.z == pytest.approx(on_table.root.z + 50.0)
+    assert raised.tip.z == pytest.approx(on_table.tip.z + 50.0)
+    assert raised.safe_position[1] == pytest.approx(on_table.safe_position[1] + 50.0)
+    assert raised.root.x == on_table.root.x
+
+
 def test_stock_too_small_is_an_error(tmp_path: Path, profile: Profile) -> None:
     with pytest.raises(DxfError, match="the stock is"):
         make_job(tmp_path, profile, stock=(150.0, 60.0))

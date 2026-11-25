@@ -26,6 +26,7 @@ from foamcam.errors import FoamcamError
 from foamcam.geometry import inside
 from foamcam.profile import Profile, load_profile
 
+from .crosstab import CrossCutPanel
 from .errors import DxfError
 from .facepick import FacePicker
 from .holes import (
@@ -52,11 +53,13 @@ from .machine import (
 )
 from .outline import Point
 from .pipeline import (
+    CORNERS,
     AlignEdge,
     Plan,
     PreviewGeometry,
     Request,
     alignment_edges,
+    block_at_corner,
     make_job,
     outline_size,
     preview_geometry,
@@ -91,13 +94,17 @@ MARGINS = {"stock_length": "margin_length", "stock_height": "margin_height"}  # 
 CUT_FIELDS = [
     ("speed", "Cut speed", "150", "mm/min"),
     ("lead_in", "Lead-in", "20", "mm"),
-    ("block_x", "Stock back face x", "", "mm, blank = centred"),
     ("safe_clearance", "Safe height above stock", "20", "mm"),
     ("min_te", "Min trailing edge", "0.6", "mm, 0 = as drawn"),
     ("segment", "Max segment length", "1", "mm"),
     ("simplify", "Simplify tolerance", "0.01", "mm, 0 = keep all"),
 ]
-DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS}
+# where the stock is: shown in the 3D tab's stock panel, set by hand or from the wire position
+STOCK_FIELDS = [
+    ("block_x", "Back face x", "", "mm, blank = centred"),
+    ("block_z", "Bottom face z", "", "mm, blank = on the table"),
+]
+DEFAULTS = {key: default for key, _, default, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS + STOCK_FIELDS}
 DEFAULTS |= {"kerf_table": "", "direction": "upper_first", "name": "", "out": str(REPO / "output")}
 DEFAULTS |= {"channel": "shortest"}  # side the wire enters inner contours (holes) from
 # how the wire leaves a hole's channel ("rapid", "cut" or mm/min), and the drawn channels (JSON, holes.py)
@@ -118,6 +125,12 @@ COLOURS = {
     "tower_34": "#e8710a",
     "target": "#202124",
 }
+
+
+VIEW3D_SHARE = 0.4  # the 3D view's first share of the Machine tab's width
+STOCK_NOTE_WIDTH = 420  # wrap of the Stock tab's notes, px
+STRAIGHT_WIRE_MM = 0.05  # towers closer than this: the wire runs along a stock edge
+TABLE_TOLERANCE_MM = 0.01  # a stock bottom this far below the table is still on it
 
 
 class FormError(ValueError):
@@ -150,6 +163,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         return n
 
     labels = {key: label for key, label, _, _ in FILE_FIELDS + PART_FIELDS + CUT_FIELDS} | STEP_LABELS
+    labels |= {key: f"Stock {label[0].lower()}{label[1:]}" for key, label, _, _ in STOCK_FIELDS}
     step = values.get("source", "dxf") == "step"
     keys = ("step", "profile") if step else ("root", "tip", "profile")
     paths = {key: Path(text(key, labels[key])) for key in keys}
@@ -173,6 +187,7 @@ def request_from_form(values: dict[str, str]) -> Request:
         block_x=number("block_x", labels["block_x"], optional=True),
         lead_in=req("lead_in", labels["lead_in"]),
         safe_clearance=req("safe_clearance", labels["safe_clearance"]),
+        block_z=number("block_z", labels["block_z"], optional=True),
     )
     exit_text = values.get("channel_exit", "rapid").strip().lower() or "rapid"
     channel_exit: str | float = exit_text
@@ -230,6 +245,11 @@ class ChannelRow:
 def _legend_slot(i: int) -> tuple[float, float]:
     """Canvas x, y of legend line i (0-7)."""
     return 12 + 290 * (i // 4), 12 + 16 * (i % 4)
+
+
+def _fixed(value: float) -> str:
+    """A position for a form field: 3 decimals, no trailing zeros."""
+    return f"{value:.3f}".rstrip("0").rstrip(".") if abs(value) >= 5e-4 else "0"
 
 
 def _number(text: str) -> float | None:
@@ -701,32 +721,42 @@ class SlicerWindow:
         tabs = ttk.Notebook(right)
         tabs.pack(fill=tk.BOTH, expand=True)
 
-        # 3D tab: orbitable view plus a wire scrubber
-        frame3d = ttk.Frame(tabs)
-        self.canvas3d = tk.Canvas(frame3d, background="white", highlightthickness=0)
+        # Machine tab: the 3D view as a full-height pane on the left (with a wire scrubber),
+        # the machine panel on the right; the stock panel is a tab beside Program, Jog and Home
+        self.machine_tab = ttk.PanedWindow(tabs, orient=tk.HORIZONTAL)
+        tabs.add(self.machine_tab, text="Machine")
+        frame3d = ttk.Frame(self.machine_tab)
+        self.machine = MachinePanel(self.machine_tab, self._current_program, self._letters, self.status.set,
+                                    faces=self._faces, on_status=self._live_status, travel=self._travel)
+        self.machine_tab.add(frame3d, weight=2)
+        self.machine_tab.add(self.machine, weight=3)
+        # the machine panel asks for all the width it can use: give the 3D view its share once
+        # the tab has a size (after that, the divider stays where it is dragged)
+        self._split_done = False
+        self.machine_tab.bind("<Configure>", self._split_machine_tab, add="+")
+        view_side = frame3d
+        # the scrubber and readout first, at the bottom, so a short pane shrinks only the view
+        controls = ttk.Frame(view_side, padding=(6, 4))
+        controls.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_readout(view_side)
+        self.canvas3d = tk.Canvas(view_side, background="white", highlightthickness=0)
         self.canvas3d.pack(fill=tk.BOTH, expand=True)
         self.view3d = View3D(self.canvas3d)
-        self._build_readout(frame3d)
-        controls = ttk.Frame(frame3d, padding=(6, 4))
-        controls.pack(fill=tk.X)
+        self.view3d.on_pick = self._pick_corner
         self.play_text = tk.StringVar(value="Play")
         ttk.Button(controls, textvariable=self.play_text, width=7, command=self.toggle_play).pack(side=tk.LEFT)
         self.wire_pos = tk.DoubleVar(value=0)
         self.scrubber = ttk.Scale(controls, from_=0, to=1, variable=self.wire_pos, command=self._scrub)
         self.scrubber.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         self.wire_label = tk.StringVar(value="")
-        ttk.Label(controls, textvariable=self.wire_label, width=30).pack(side=tk.LEFT)
-        ttk.Button(controls, text="Reset view", command=self.view3d.reset).pack(side=tk.LEFT)
+        ttk.Label(controls, textvariable=self.wire_label, width=22).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Reset view", command=lambda: self.view3d.reset()).pack(side=tk.LEFT)
         self.playing = False
-        tabs.add(frame3d, text="3D")
-
-        self.align_frame = ttk.Frame(tabs, padding=12)
-        tabs.add(self.align_frame, text="Align stock")
+        self.stock_pane = ttk.Frame(self.machine.controls, padding=8)
+        self.stock_corner = tk.StringVar(value="front_top")  # not a form value: picking one keeps the preview
+        self.stock_wire_text = tk.StringVar(value="")
         self._update_alignment()
 
-        self.machine = MachinePanel(tabs, self._current_program, self._letters, self.status.set,
-                                    faces=self._faces, on_status=self._live_status, travel=self._travel)
-        tabs.add(self.machine, text="Machine")
         # the section view lives in the Machine tab, beside the console, to watch the live position
         self.section_frame = ttk.Frame(self.machine.views)
         bar = ttk.Frame(self.section_frame, padding=(4, 2))
@@ -759,6 +789,9 @@ class SlicerWindow:
                               profile_path=lambda: Path(self.vars["profile"].get().strip()),
                               target=lambda: self.vars["speed"].get(), saved=self._kerf_saved)
         self.machine.controls.add(self.kerf, text="Kerf")
+        self.machine.controls.add(self.stock_pane, text="Stock")
+        self.cross_cut = CrossCutPanel(self.machine.controls, self.machine, profile=self._profile)
+        self.machine.controls.add(self.cross_cut, text="Cut")
         self.machine.views.insert(0, self.section_frame, text="Section")
         self.machine.views.select(self.section_frame)  # type: ignore[no-untyped-call]
         report_frame = ttk.Frame(tabs)
@@ -785,41 +818,139 @@ class SlicerWindow:
         self.root.bind_all("<KeyPress>", self._key_down, add="+")
         self.root.bind_all("<KeyRelease>", self._key_up, add="+")
 
+    def _split_machine_tab(self, event: "tk.Event[ttk.PanedWindow]") -> None:
+        if self._split_done or event.width < 200:
+            return
+        self._split_done = True
+        self.machine_tab.sashpos(0, int(event.width * VIEW3D_SHARE))  # type: ignore[no-untyped-call]
+
     def _update_alignment(self) -> None:
-        """Fill the Align stock tab: where to put the wire on each long stock edge."""
-        frame = self.align_frame
+        """Fill the Stock tab (Machine tab controls): where the stock is, its corners, the live wire."""
+        frame = self.stock_pane
         for child in frame.winfo_children():
             child.destroy()
-        g = self.geometry
-        intro = (
-            "Put the wire on a stock edge, then push the stock against the wire to place and square it.\n"
-            "Both towers go to the same position, so the wire runs exactly along the edge.\n\n"
-            "Run the G-code with the wire COLD and no stock on the table: it lifts first, crosses at the\n"
-            "safe height, then goes straight down. Then slide the stock in until the edge just touches the\n"
-            "wire along its whole length. Use a top edge to set the stock's x position; the bottom edges lie\n"
-            "on the table. Positions are the wire's centre: the stock face sits half a wire diameter away."
-        )
-        ttk.Label(frame, text=intro, justify="left").grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 12))
-        if g is None:
-            ttk.Label(frame, text="Press Preview first.", foreground="#5f6368").grid(row=1, column=0, sticky="w")
+        wrap = STOCK_NOTE_WIDTH
+        place = ttk.LabelFrame(frame, text="Stock position (G54)", padding=6)
+        place.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+        for row, (key, label, _, unit) in enumerate(STOCK_FIELDS):
+            ttk.Label(place, text=label).grid(row=2 * row, column=0, sticky="w", pady=(2, 0))
+            ttk.Entry(place, textvariable=self.vars[key], width=10).grid(row=2 * row, column=1, sticky="w", padx=4)
+            ttk.Label(place, text=unit, foreground="#5f6368").grid(row=2 * row + 1, column=0, columnspan=2, sticky="w")
+
+        corner = ttk.LabelFrame(frame, text="Corner", padding=6)
+        corner.grid(row=0, column=1, sticky="nsw", padx=(0, 8))
+        for row, (key, (label, _, _)) in enumerate(CORNERS.items()):
+            ttk.Radiobutton(corner, text=label, value=key, variable=self.stock_corner,
+                            command=self._corner_changed).grid(row=row, column=0, sticky="w")
+        ttk.Label(corner, foreground="#5f6368", text="or click a long stock\nedge in the 3D view").grid(
+            row=4, column=0, sticky="w", pady=(2, 0))
+        self.corner_text = ttk.Label(corner, font=("Consolas", 9), justify="left")
+        self.corner_text.grid(row=0, column=1, rowspan=3, sticky="nw", padx=(12, 0))
+        buttons = ttk.Frame(corner)
+        buttons.grid(row=3, column=1, rowspan=2, sticky="sw", padx=(12, 0))
+        self.corner_buttons = [
+            ttk.Button(buttons, text="Wire to this corner", command=self._go_to_corner),
+            ttk.Button(buttons, text="Copy G-code", command=self._copy_corner),
+        ]
+        for button in self.corner_buttons:
+            button.pack(fill=tk.X, pady=1)
+
+        wire = ttk.LabelFrame(frame, text="Wire now", padding=6)
+        wire.grid(row=0, column=2, sticky="nsw", padx=(0, 8))
+        ttk.Label(wire, textvariable=self.stock_wire_text, font=("Consolas", 9), justify="left").pack(anchor="w")
+        ttk.Button(wire, text="This corner is at the wire", command=self._corner_at_wire).pack(
+            anchor="w", pady=(6, 0))
+
+        notes = ttk.Frame(frame)
+        notes.grid(row=0, column=3, sticky="nsew")
+        frame.columnconfigure(3, weight=1)
+        note = ttk.Label(notes, foreground="#5f6368", wraplength=wrap, justify="left", text=(
+            "Several parts from one block: jog the cold wire onto a corner of the foam that is left, "
+            "pick that corner and press \"This corner is at the wire\". Only this stock is checked: "
+            "cut the front (high x, where the wire enters) and the top of the block first. "
+            "Positions are the wire's centre."))
+        note.pack(anchor="w", fill=tk.X)
+        notes.bind("<Configure>", lambda e: note.configure(wraplength=max(150, e.width - 4)))
+        self._corner_changed()
+        self._show_live_wire()
+
+    def _corner_edge(self) -> AlignEdge | None:
+        """The selected corner's long edge in the last preview, or None."""
+        if self.geometry is None:
+            return None
+        key = self.stock_corner.get()
+        return next((e for e in alignment_edges(self.geometry) if e.corner == key), None)
+
+    def _corner_changed(self) -> None:
+        """Highlight the selected corner in the 3D view and show where it is."""
+        edge = self._corner_edge()
+        state = ["!disabled"] if edge is not None else ["disabled"]
+        for button in self.corner_buttons:
+            button.state(state)
+        if edge is None:
+            self.corner_text.configure(text="Press Preview to see where this corner is.")
+            self.view3d.highlight = None
+        else:
+            l1, l2, l3, l4 = self._letters()
+            self.corner_text.configure(text=f"{l1} = {l3} = {edge.x:.3f}\n{l2} = {l4} = {edge.z:.3f}")
+            self.view3d.highlight = (edge.x, edge.z, CORNERS[edge.corner][0] + " edge")
+        self.view3d.draw()
+
+    def _pick_corner(self, key: str) -> None:
+        """A long stock edge was clicked in the 3D view."""
+        self.stock_corner.set(key)
+        self._corner_changed()
+
+    def _live_towers(self) -> tuple[Point, Point] | None:
+        st = self.live
+        return None if st is None else tower_positions(st.wpos, self._letters())
+
+    def _show_live_wire(self) -> None:
+        """The live wire in the 3D view and in the stock panel."""
+        towers = self._live_towers()
+        self.view3d.set_live(towers)
+        if towers is None:
+            self.stock_wire_text.set("not connected: connect on the Machine tab")
             return
-        l1, l2, l3, l4 = g.letters
-        headers = ("Edge", f"{l1} = {l3}", f"{l2} = {l4}", "", "", "")
-        for col, text in enumerate(headers):
-            ttk.Label(frame, text=text, font=("Segoe UI", 9, "bold")).grid(row=1, column=col, sticky="w", padx=6)
-        for row, edge in enumerate(alignment_edges(g), start=2):
-            ttk.Label(frame, text=edge.name).grid(row=row, column=0, sticky="w", padx=6, pady=3)
-            ttk.Label(frame, text=f"{edge.x:.3f}", font=("Consolas", 10)).grid(row=row, column=1, sticky="e", padx=6)
-            ttk.Label(frame, text=f"{edge.z:.3f}", font=("Consolas", 10)).grid(row=row, column=2, sticky="e", padx=6)
-            ttk.Button(frame, text="Copy G-code", command=functools.partial(self._copy_edge, edge)).grid(
-                row=row, column=3, padx=4)
-            ttk.Button(frame, text="Show in 3D", command=functools.partial(self._show_edge, edge)).grid(
-                row=row, column=4, padx=4)
-            ttk.Button(frame, text="Go there", command=functools.partial(self._go_to_edge, edge)).grid(
-                row=row, column=5, padx=4)
-        self.align_text = tk.Text(frame, height=4, width=60, font=("Consolas", 10))
-        self.align_text.grid(row=7, column=0, columnspan=6, sticky="we", pady=(12, 0))
-        self.align_text.insert("1.0", "Copy G-code puts the three lines for that edge here and on the clipboard.")
+        (x1, z1), (x2, z2) = towers
+        l1, l2, l3, l4 = self._letters()
+        text = f"{l1} {x1:.3f}  {l2} {z1:.3f}\n{l3} {x2:.3f}  {l4} {z2:.3f}"
+        if math.hypot(x1 - x2, z1 - z2) > STRAIGHT_WIRE_MM:
+            text += "\nthe towers differ: not along a stock edge"
+        self.stock_wire_text.set(text)
+
+    def _corner_at_wire(self) -> None:
+        """Place the stock so the selected corner is where the wire is now, then preview."""
+        towers = self._live_towers()
+        if towers is None:
+            messagebox.showwarning("No wire position", "Connect on the Machine tab first: the wire "
+                                   "position comes from the machine.", parent=self.root)
+            return
+        (x1, z1), (x2, z2) = towers
+        if math.hypot(x1 - x2, z1 - z2) > STRAIGHT_WIRE_MM:
+            messagebox.showwarning("Wire not along the edge", (
+                f"The towers differ by {x1 - x2:+.2f} mm horizontally and {z1 - z2:+.2f} mm vertically. "
+                "Put both towers at the same position, so the wire runs along the stock edge, first."),
+                parent=self.root)
+            return
+        length, height = _number(self.vars["stock_length"].get()), _number(self.vars["stock_height"].get())
+        if length is None or height is None or length <= 0 or height <= 0:
+            messagebox.showwarning("Stock size", "Enter the stock length and height first.", parent=self.root)
+            return
+        key = self.stock_corner.get()
+        x, z = block_at_corner(key, ((x1 + x2) / 2, (z1 + z2) / 2), length, height)
+        profile = self._profile()
+        if profile is not None and z < profile.table_z - TABLE_TOLERANCE_MM:
+            messagebox.showwarning("Below the table", (
+                f"With the {CORNERS[key][0]} corner at the wire, the stock's bottom face would be at "
+                f"z = {z:.2f}, below the table (z = {profile.table_z:g}). Pick another corner or "
+                "check the stock height."), parent=self.root)
+            return
+        self.vars["block_x"].set(_fixed(x))
+        self.vars["block_z"].set(_fixed(z))
+        self.status.set(f"Stock placed with its {CORNERS[key][0]} corner at the wire: "
+                        f"back face x = {x:.3f}, bottom face z = {z:.3f}.")
+        self.preview()
 
     def _current_program(self) -> Program:
         """The G-code of the last Preview, for the Machine tab. Raises ValueError if stale."""
@@ -846,6 +977,7 @@ class SlicerWindow:
     def _live_status(self, status: Status | None) -> None:
         self.live = status
         self._draw_live()
+        self._show_live_wire()
         self._show_speed()
 
     def _show_speed(self) -> None:
@@ -870,7 +1002,7 @@ class SlicerWindow:
             "  - the wire heat is OFF\n"
             "  - no stock on the table yet (slide it in afterwards)\n"
             "  - the work zero is the one this job was made for")):
-            self.tabs.select(self.machine)  # type: ignore[no-untyped-call]
+            self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
 
     def _profile(self) -> Profile | None:
         """The machine profile in the form (read again when the file changes), or None."""
@@ -900,36 +1032,40 @@ class SlicerWindow:
         profile = self._profile()
         return profile.letters if profile is not None else ("X", "Y", "Z", "A")
 
+    def _go_to_corner(self) -> None:
+        edge = self._corner_edge()
+        if edge is not None:
+            self._go_to_edge(edge)
+
+    def _copy_corner(self) -> None:
+        edge = self._corner_edge()
+        if edge is not None:
+            self._copy_edge(edge)
+
     def _copy_edge(self, edge: AlignEdge) -> None:
         text = "\n".join(edge.gcode)
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
-        self.align_text.delete("1.0", tk.END)
-        self.align_text.insert("1.0", f"; wire on the {edge.name}\n{text}")
-        self.status.set(f"Copied the G-code for the {edge.name}. Paste it into ioSender's MDI, wire cold.")
-
-    def _show_edge(self, edge: AlignEdge) -> None:
-        self.view3d.highlight = (edge.x, edge.z, edge.name)
-        self.view3d.draw()
-        self.tabs.select(self.frame3d)  # type: ignore[no-untyped-call]
+        self.status.set(f"Copied the G-code for the {edge.name} ({' | '.join(edge.gcode)}). "
+                        "Paste it into ioSender's MDI, wire cold.")
 
     def _build_readout(self, parent: ttk.Frame) -> None:
         """Digital readout of the wire at the slider position, like a machine DRO."""
-        dro = tk.Frame(parent, background="#202124", padx=10, pady=6)
-        dro.pack(fill=tk.X)
-        big = ("Consolas", 15, "bold")
-        small = ("Consolas", 10)
+        dro = tk.Frame(parent, background="#202124", padx=8, pady=4)
+        dro.pack(side=tk.BOTTOM, fill=tk.X)
+        big = ("Consolas", 12, "bold")  # smaller than the machine's DRO above: this is the preview
+        small = ("Consolas", 9)
         self.dro_axes: list[tuple[tk.StringVar, tk.StringVar]] = []
         for i in range(4):
             letter, value = tk.StringVar(value=" "), tk.StringVar(value="   ---.---")
             cell = tk.Frame(dro, background="#202124")
-            cell.grid(row=0, column=i, sticky="w", padx=(0, 26))
+            cell.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, 14))  # 2 x 2: fits a narrow pane
             tk.Label(cell, textvariable=letter, font=big, fg="#8ab4f8", bg="#202124").pack(side=tk.LEFT)
             tk.Label(cell, textvariable=value, font=big, fg="#e8eaed", bg="#202124").pack(side=tk.LEFT)
             self.dro_axes.append((letter, value))
         self.dro_detail = tk.StringVar(value="Press Preview, then scrub or play the cut.")
         tk.Label(dro, textvariable=self.dro_detail, font=small, fg="#bdc1c6", bg="#202124",
-                 justify="left", anchor="w").grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
+                 justify="left", anchor="w").grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
     def _update_readout(self, i: int) -> None:
         g = self.geometry
@@ -1026,7 +1162,7 @@ class SlicerWindow:
         self.status.set(f"OK: cut time {self.result.total_time:.2f} min, "
                         f"{sum(m.kind != 'rapid' for m in self.result.moves)} feed moves. Press Generate to write files.")
         if self.tabs.select() == str(self.report_frame):  # type: ignore[no-untyped-call]
-            self.tabs.select(self.frame3d)  # type: ignore[no-untyped-call]
+            self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
         self.draw()
         self.view3d.show(self.geometry)
         self._update_alignment()

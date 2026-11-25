@@ -764,3 +764,129 @@ their own blocks and checks the notes and that the pane hides again;
 screenshots of the pane.
 NOT verified: the pane with many holes beyond scrolling with the scrollbar (the
 mouse wheel does not scroll the list).
+
+## 15. Kerf-table errors with shallow channels (owner's report)
+
+Symptom: channels at shallow angles to the skin failed with "kerf table ...:
+speed N mm/min is outside the table range 167 to 600 mm/min".
+
+Cause (reproduced on WingEndChordSectionImprovedHoles.STEP with the owner's
+settings, hole2 at 335-345 degrees): root and tip used the same channel angle
+about each hole's own centre. A shallow line meets the two sections far apart
+(at 345 degrees: 44 mm from the start at the root, 77 mm at the tip), so the
+outer-contour stretch before that slit was 44.6 mm at the root and 77.4 mm at
+the tip. Both faces cover a stretch in the same time, so the root face moved
+at 250 x 44.6 / 77.4 = 144 mm/min, below the table.
+
+Fixes:
+- Front end (`holes.drawn_paths`): the tip channel turns from the spec angle
+  (up to 40 degrees, found by stepping and halving) so it meets the outer
+  contour at the same fraction of the way along the same side from the leading
+  edge as the root channel, or the other hole in the same direction from its
+  centre. The handles and the spec stay on the root.
+- Front end (`channel_path`): a drawn channel's last point is now at least
+  0.5 mm clear of the outline (it was 2 mm along the line, which on a shallow
+  line can be a few hundredths of a mm outside, and §6.2 trailing-edge
+  thickening then put it back in the foam: "invalid job"). A line that cannot
+  get that clear before coming back into the foam is reported: "the channel
+  only grazes the outer contour ...; turn it more steeply".
+- CAM: after the exact out-of-table message (machine-profile.md §7, kept as
+  it was), a second problem line names the stretch and its root and tip
+  lengths ("why: the outer contour from start to slit "hole2" is ...").
+
+Verified: on the committed code, hole1 at 5/180/200 degrees with hole2 at
+340/345 degrees all failed with this error; with the fix all cut (2.7-2.9
+min). `check.py cam` and `check.py dxf` pass; new tests: tip channel meets the
+root's place (and would not without matching), grazing channel reported,
+"why" line.
+
+NOT verified: on the machine. A stretch can still be too slow for other
+reasons (very different sections, or slits far apart at the two ends by
+design); the "why" line now says which. Measuring the kerf table below
+167 mm/min would also widen what can be cut.
+
+## 16. Several parts from one block: stock corner at the wire (owner's request)
+
+Request: cut several airfoils from one block. In the stock alignment, put a
+chosen corner of the stock at the wire's position; draw the real wire in the
+3D view; move the stock alignment into the 3D view.
+
+Format change (approved by the owner in this session): job-file.md §5 has a
+new optional `block.z`, the G54 `z` of the block's bottom face (default
+`table_z`). The block may now be a part of a larger block, e.g. the next
+layer of a stack. §10.6 now says the rapid check uses that box, and that foam
+outside the block is not checked.
+
+Built:
+- foamcam: `Block.z` and `Block.bottom(table_z)`; the §6.7 inside-block
+  check, the §10.6 rapid check, the text report and the SVG use it.
+- foamsim: reads `block.z` (default 0, since the simulator still takes the
+  table at z = 0) for its block box, target check and plot.
+- foamdxf: `Placement.block_z` (CLI `--block-z`). The outlines are centred in
+  the raised stock and the safe height is above it. `pipeline.CORNERS` and
+  `block_at_corner` give the block x and z for a corner at a given wire
+  position.
+- GUI layout (second request: "the 3D view should just be a panel in the
+  machine view, to the left"): the 3D and Align stock tabs are gone; the
+  right side has only Machine and Report. The Machine tab is split: the 3D
+  view (with its preview readout in 2 x 2 and the Play slider) runs the full
+  height on the left, at 40 % of the width at first (a draggable divider);
+  the machine panel is on the right. The stock panel is a "Stock" tab beside
+  Program, Jog, Home and Kerf, laid out across its width: the back face x and
+  bottom face z (moved from the Cut form), the four corners as radio buttons
+  (or click a long stock edge in the 3D view) with where that corner is,
+  "Wire to this corner" and "Copy G-code" (the copied lines go to the
+  clipboard and the status bar), the live wire position, and "This corner is
+  at the wire". That button needs both towers within 0.05 mm of each other,
+  refuses a stock below the table, sets the block x and z, and runs Preview
+  again.
+- 3D view: the machine's wire is drawn from the status reports (purple,
+  dashed, with its coordinates). The selected corner's edge is green.
+
+Verified: `check.py cam` and `check.py dxf` pass; `check.py sim` has the same
+19 old failures, and its new test passes. New tests: block.z read, same G-code
+at z = table_z, raised part cut, part below the raised block refused, rapid
+check uses the raised block, the simulator accepts a raised block, jobgen
+raises the stock and the safe height, corner maths, form field, stock panel
+in the 3D tab, clicking an edge picks it, and live wire to placed stock with
+the not-connected, bent-wire and below-table refusals. Screenshots of the Machine
+tab at 1500 x 900 were checked by eye.
+
+NOT verified: on the machine. Positions are the wire's centre, as before: the
+foam face sits half a wire diameter from where the panel says. Only this
+stock is known to the CAM: foam of the bigger block in front of it (where the
+wire enters) or above it (the safe height) is cut through without a check, so
+cut from the front and the top of the block first.
+
+## 17. Cut tab: a straight cut across the table (owner's request)
+
+Request: a Cut tab that puts the wire at the operator side at a given height,
+then cuts by moving the wire all the way across at a given speed.
+
+Built:
+- `foamdxf/crosscut.py`: `plan_cross_cut(profile, z, speed)` spans the travel
+  shared by axes 1 and 3, from its low end (the operator side, where the axes
+  home: machine-profile.md §3.2) to its high end. It refuses a height outside
+  the vertical travel shared by axes 2 and 4, and a speed of 0 or above the
+  horizontal axes' max rate. Two absolute programs, both towers always level
+  (straight wire): "to the start" (G0 across at the wire's current height,
+  then G0 straight to the height) and "the cut" (one G94 G1 to the far side
+  at the speed). `away_from_start` checks that the wire is at the start
+  (0.05 mm).
+- `foamdxf/crosstab.py`: the "Cut" tab beside Program, Jog, Home, Kerf and
+  Stock. Fields: height (wire centre, G54 z) and speed, remembered in the
+  machine settings. A line shows from where to where and how long. "1. Wire
+  to the start (cold)" and "2. Cut across (hot)" run through the Machine
+  tab's confirm-and-stream path, with heat checklists. The cut is refused
+  until the wire is at the start, sets the feed override back to 100 %, and
+  ends with the usual "switch the wire heat off".
+
+Verified: `check.py dxf` passes. New tests: travel span and refusals, the two
+programs, the at-start check, and a Cut tab run on the fake controller
+(refused before the start, the start moves, the cut line, the remembered
+values). A screenshot of the tab at 1500 x 900 was checked by eye.
+
+NOT verified: on the machine. The move to the start goes across at the
+wire's current height first, so the wire must be above or beside the foam
+when it is pressed. The cut runs the full travel, from limit to limit. The
+kerf is not compensated: the cut is centred on the height.

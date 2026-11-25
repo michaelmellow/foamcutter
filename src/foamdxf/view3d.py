@@ -6,18 +6,31 @@ z up. Orthographic projection, orbited with the mouse:
 
   left drag   rotate          wheel        zoom
   right drag  pan             double-click reset the view
+  click a long stock edge: pick that corner (on_pick)
+
+The live wire (`live`, from the machine's status reports) is drawn over the
+preview, so the stock can be placed against where the wire really is.
 """
 
 import math
 import tkinter as tk
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .pipeline import PreviewGeometry
+
+Point2 = tuple[float, float]
 
 Point3 = tuple[float, float, float]
 
 # Default view: from the operator's side, a little from above and to the side,
 # with +x (away from the operator) going into the screen and the wire left-right.
+PICK_PIXELS = 10.0  # a click this close to a long stock edge picks its corner
+CLICK_PIXELS = 4  # a press and release closer than this is a click, not a drag
+COMPACT_HEIGHT = 420  # below this canvas height the legend is tighter and the mouse hints are left out
+# long stock edges, as in pipeline.CORNERS: key -> (at high x, at the top)
+EDGES = {"back_top": (False, True), "front_top": (True, True),
+         "back_bottom": (False, False), "front_bottom": (True, False)}
 DEFAULT_YAW = 65.0  # degrees about z
 DEFAULT_PITCH = 25.0  # degrees above the horizon
 
@@ -30,6 +43,7 @@ COLOURS = {
     "surface": "#c5cad1",
     "wire": "#d93025",
     "align": "#188038",
+    "live": "#9334e6",
     "text": "#202124",
     "muted": "#5f6368",
 }
@@ -67,10 +81,14 @@ class View3D:
         self.geometry: PreviewGeometry | None = None
         self.wire_index = 0
         self.highlight: tuple[float, float, str] | None = None  # (x, z, name) of a stock edge to show
+        self.live: tuple[Point2, Point2] | None = None  # the machine's towers (axes 1-2, axes 3-4), work frame
+        self.on_pick: Callable[[str], None] | None = None  # called with the corner key of a clicked stock edge
         self._drag: tuple[int, int] | None = None
+        self._down: tuple[int, int] | None = None  # where the left button went down
         canvas.bind("<Configure>", lambda _e: self.draw())
-        canvas.bind("<ButtonPress-1>", self._press)
+        canvas.bind("<ButtonPress-1>", self._press_left)
         canvas.bind("<B1-Motion>", self._rotate)
+        canvas.bind("<ButtonRelease-1>", self._release_left)
         canvas.bind("<ButtonPress-3>", self._press)
         canvas.bind("<B3-Motion>", self._pan)
         canvas.bind("<MouseWheel>", self._wheel)  # Windows, macOS
@@ -95,6 +113,30 @@ class View3D:
     def reset(self) -> None:
         self.camera = Camera()
         self.draw()
+
+    def set_live(self, towers: tuple[Point2, Point2] | None) -> None:
+        """Show the machine's wire between these tower positions (None: hide it)."""
+        if towers != self.live:
+            self.live = towers
+            self.draw()
+
+    def edge_at(self, cx: float, cy: float) -> str | None:
+        """Corner key of the long stock edge within PICK_PIXELS of canvas point (cx, cy), or None."""
+        g = self.geometry
+        if g is None:
+            return None
+        centre, scale = self._frame()
+        w, h = self._size()
+        sx0, sz0, sx1, sz1 = g.stock
+        best, found = PICK_PIXELS, None
+        for key, (front, top) in EDGES.items():
+            x, z = (sx1 if front else sx0), (sz1 if top else sz0)
+            a = self.camera.project((x, g.root_y, z), centre, scale, w, h)
+            b = self.camera.project((x, g.tip_y, z), centre, scale, w, h)
+            d = _to_segment((cx, cy), a, b)
+            if d < best:
+                best, found = d, key
+        return found
 
     # --- geometry ---------------------------------------------------------------------------
 
@@ -193,6 +235,15 @@ class View3D:
         a, b = g.tower_12[i], g.tower_34[i]
         self._line([(a[0], 0.0, a[1]), (b[0], W, b[1])], COLOURS["wire"], width=2.5)
 
+        # the machine's wire, where it really is now (work coordinates)
+        if self.live is not None:
+            (x1, z1), (x2, z2) = self.live
+            self._line([(x1, 0.0, z1), (x2, W, z2)], COLOURS["live"], width=3, dash=(8, 4))
+            for x, y, z in ((x1, 0.0, z1), (x2, W, z2)):
+                self._line([(x, y, z - 6), (x, y, z + 6)], COLOURS["live"], width=2)
+                self._line([(x - 6, y, z), (x + 6, y, z)], COLOURS["live"], width=2)
+            labels.append(((x2, W, z2 - 12), f"live wire {l1}{x1:.2f} {l2}{z1:.2f} {l3}{x2:.2f} {l4}{z2:.2f}"))
+
         if self.highlight is not None:
             hx, hz, name = self.highlight
             self._line([(hx, 0.0, hz), (hx, W, hz)], COLOURS["align"], width=3)
@@ -221,19 +272,38 @@ class View3D:
             (COLOURS["root"], (5, 3), 1, f"{l1}/{l2} carriage"),
             (COLOURS["tip"], (5, 3), 1, f"{l3}/{l4} carriage"),
             (COLOURS["stock"], (), 1, "stock"),
-            (COLOURS["wire"], (), 2.5, "wire"),
+            (COLOURS["wire"], (), 2.5, "wire (slider)"),
         ]
+        if self.live is not None:
+            items.append((COLOURS["live"], (8, 4), 3, "wire now (machine)"))
+        _, h = self._size()
+        step = 16 if h >= COMPACT_HEIGHT else 13
         for k, (colour, dash, width, label) in enumerate(items):
-            y = 14 + 16 * k
+            y = 12 + step * k
             self.canvas.create_line(12, y, 40, y, fill=colour, width=width, dash=dash)
             self.canvas.create_text(46, y, text=label, anchor="w", fill=COLOURS["text"])
-        self.canvas.create_text(12, 14 + 16 * len(items) + 4, anchor="nw", fill=COLOURS["muted"],
-                                text="drag: rotate   right-drag: pan   wheel: zoom   double-click: reset")
+        if h < COMPACT_HEIGHT:  # a short pane: the drawing needs the room more than the hints
+            return
+        self.canvas.create_text(12, 12 + step * len(items) + 4, anchor="nw", fill=COLOURS["muted"],
+                                text="drag: rotate   right-drag: pan   wheel: zoom   double-click: reset\n"
+                                     "click a long stock edge: pick that corner")
 
     # --- mouse ------------------------------------------------------------------------------
 
     def _press(self, event: "tk.Event[tk.Canvas]") -> None:
         self._drag = (event.x, event.y)
+
+    def _press_left(self, event: "tk.Event[tk.Canvas]") -> None:
+        self._press(event)
+        self._down = (event.x, event.y)
+
+    def _release_left(self, event: "tk.Event[tk.Canvas]") -> None:
+        down, self._down = self._down, None
+        if down is None or abs(event.x - down[0]) + abs(event.y - down[1]) > CLICK_PIXELS:
+            return  # a drag (rotation), not a click
+        key = self.edge_at(event.x, event.y)
+        if key is not None and self.on_pick is not None:
+            self.on_pick(key)
 
     def _rotate(self, event: "tk.Event[tk.Canvas]") -> None:
         if self._drag is None:
@@ -258,3 +328,11 @@ class View3D:
     def _zoom(self, factor: float) -> None:
         self.camera.zoom = max(0.2, min(20.0, self.camera.zoom * factor))
         self.draw()
+
+
+def _to_segment(p: Point2, a: Point2, b: Point2) -> float:
+    """Distance from p to the segment a-b (canvas pixels)."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    n = dx * dx + dy * dy
+    t = 0.0 if n == 0 else max(0.0, min(1.0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / n))
+    return math.dist(p, (a[0] + t * dx, a[1] + t * dy))

@@ -30,7 +30,7 @@ tip drawings into matching `kind: "hole"` features:
 import itertools
 import json
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from foamcam.geometry import inside
 from foamcam.job import Feature
@@ -44,6 +44,7 @@ MIN_CIRCLE_POINTS = 16  # a hole without corners gets at least this many points
 CHANNELS = ("shortest", "upper", "lower")
 SHAPES = ("auto", "straight", "curved")  # auto: straight up or down, from the CHANNELS setting
 BEYOND_MM = 2.0  # a drawn channel's last point lies this far past the outer contour (§8)
+CLEAR_MM = 0.5  # a drawn channel's last point lies at least this far outside the outer contour
 SLIT_EDGE_MM = 0.25  # half the length of the parent edge a channel into another hole crosses
 
 
@@ -187,9 +188,17 @@ def drawn_paths(
     root_others: dict[str, tuple[Point, ...]] | None = None,
     tip_others: dict[str, tuple[Point, ...]] | None = None,
 ) -> tuple[ChannelPath, ChannelPath]:
-    """A hole's drawn channel at root and tip, checked to match. Raises DxfError."""
+    """A hole's drawn channel at root and tip, checked to match. Raises DxfError.
+
+    The tip channel turns by a few degrees from `spec.angle` if needed, so that it
+    meets the outer contour (or the other hole) at the same place as the root one:
+    the same fraction of the way from the leading edge along that side, or the same
+    direction from the other hole's centre. Otherwise a shallow channel can meet the
+    two sections far apart, and the outer contour between two slits is then much
+    longer at one face than the other: that face crawls (below the kerf table)."""
     rc = channel_path(spec, root_outer, root_hole, max_segment, where=f"{name} (root)", others=root_others)
-    tc = channel_path(spec, tip_outer, tip_hole, max_segment, bends=_bends(rc, spec),
+    angle = _matching_angle(spec, rc, tip_outer, tip_hole, max_segment, root_outer, root_others, tip_others)
+    tc = channel_path(replace(spec, angle=angle), tip_outer, tip_hole, max_segment, bends=_bends(rc, spec),
                       clockwise=rc.clockwise, where=f"{name} (tip)", others=tip_others)
     if len(rc.points) != len(tc.points):  # the bend steps follow the root: always equal
         raise DxfError(f"{name}: the root and tip channels have different point counts")
@@ -198,6 +207,96 @@ def drawn_paths(
     if not rc.into and rc.slit != tc.slit:
         raise DxfError(f"{name}: the channel meets the {rc.slit} side at the root but the {tc.slit} side at the tip")
     return rc, tc
+
+
+MATCH_SEARCH_DEGREES = 40  # the tip channel may turn this far from the spec to meet the same place
+MATCH_STEP_DEGREES = 2
+
+
+def _matching_angle(
+    spec: ChannelSpec,
+    rc: "ChannelPath",
+    tip_outer: tuple[Point, ...],
+    tip_hole: tuple[Point, ...],
+    max_segment: float,
+    root_outer: tuple[Point, ...],
+    root_others: dict[str, tuple[Point, ...]] | None,
+    tip_others: dict[str, tuple[Point, ...]] | None,
+) -> float:
+    """The tip channel's angle that meets the place the root channel meets (`spec.angle`
+    if none in reach does): found by stepping out from `spec.angle`, then halving."""
+    target = _slit_place(rc, root_outer, root_others)
+
+    def error(angle: float) -> float | None:
+        try:
+            tc = channel_path(replace(spec, angle=angle), tip_outer, tip_hole, max_segment,
+                              bends=_bends(rc, spec), clockwise=rc.clockwise, others=tip_others)
+        except DxfError:
+            return None
+        if tc.into != rc.into or (not rc.into and tc.slit != rc.slit):
+            return None
+        e = _slit_place(tc, tip_outer, tip_others) - target
+        return (e + 180) % 360 - 180 if rc.into else e  # a direction about the other hole, or a fraction
+
+    near = 90.0 if rc.into else 0.25  # a sign change bigger than this is a jump (round the trailing edge)
+    e0 = error(spec.angle)
+    if e0 is None or e0 == 0:
+        return spec.angle
+    for k in range(1, MATCH_SEARCH_DEGREES // MATCH_STEP_DEGREES + 1):
+        for step in (MATCH_STEP_DEGREES, -MATCH_STEP_DEGREES):
+            a, b = spec.angle + (k - 1) * step, spec.angle + k * step
+            ea, eb = error(a), error(b)
+            if ea is None or eb is None or ea * eb > 0 or abs(ea - eb) > near:
+                continue
+            for _ in range(30):
+                mid = (a + b) / 2
+                em = error(mid)
+                if em is None:
+                    break
+                if em * ea > 0:
+                    a, ea = mid, em
+                else:
+                    b = mid
+            return (a + b) / 2
+    return spec.angle
+
+
+def _slit_place(path: "ChannelPath", outer: tuple[Point, ...], others: dict[str, tuple[Point, ...]] | None) -> float:
+    """Where a channel meets: its direction (degrees) from the centre of the hole it ends
+    in, or how far along the outer contour from the leading edge (fraction of that side:
+    + on the upper side, - on the lower side)."""
+    if path.into and others and path.into in others:
+        c = area_centre(list(others[path.into]))
+        return math.degrees(math.atan2(path.slit_point[1] - c[1], path.slit_point[0] - c[0]))
+    loop = list(outer)
+    n = len(loop)
+    run = [0.0]
+    for i in range(n):
+        run.append(run[-1] + math.dist(loop[i], loop[(i + 1) % n]))
+    edge = min(range(n), key=lambda i: math.dist(path.slit_point, _foot(path.slit_point, loop[i], loop[(i + 1) % n])[0]))
+    _, f = _foot(path.slit_point, loop[edge], loop[(edge + 1) % n])
+    s = run[edge] + f * (run[edge + 1] - run[edge])
+    i_le = min(range(n), key=lambda i: (loop[i][0], i))
+    s_le, total = run[i_le], run[n]
+    return (s_le - s) / s_le if s <= s_le else -(s - s_le) / (total - s_le)
+
+
+def _clear_of(outer: list[Point], start: Point, d: Point, t_q: float, t_far: float, where: str) -> float:
+    """How far along the channel line its last point goes: at least BEYOND_MM past where it
+    leaves the foam, further if needed to be CLEAR_MM away from the outer contour, but not
+    past halfway to where the line comes back into the foam."""
+    limit = (t_far - t_q) / 2 if math.isfinite(t_far) else 50.0
+    step = min(BEYOND_MM, limit)
+    t_x = t_q + step
+    while True:
+        p = (start[0] + t_x * d[0], start[1] + t_x * d[1])
+        gap = min(math.dist(p, _foot(p, outer[i], outer[(i + 1) % len(outer)])[0]) for i in range(len(outer)))
+        if gap >= CLEAR_MM:
+            return t_x
+        if t_x - t_q >= limit - 1e-9:
+            raise DxfError(f"{where}: the channel only grazes the outer contour (its line runs within "
+                           f"{gap:.2f} mm of the outline); turn it more steeply")
+        t_x = min(t_x + step, t_q + limit)
 
 
 def _target(path: "ChannelPath") -> str:
@@ -263,6 +362,8 @@ def channel_path(
             into, t_q = other, hits_o[0]
             t_far = hits_o[1] if len(hits_o) > 1 else hits_o[0] + 2 * BEYOND_MM
     t_x = t_q + min(BEYOND_MM, (t_far - t_q) / 2)
+    if not into:  # the last point must lie clearly outside: §6.2 may thicken the trailing edge
+        t_x = _clear_of(list(outer), start, d, t_q, t_far, where)
     last = (start[0] + t_x * d[0], start[1] + t_x * d[1])
     length = sum(math.dist(p, q) for p, q in zip([entry, *bend], bend)) + t_q
     hit = (start[0] + t_q * d[0], start[1] + t_q * d[1])

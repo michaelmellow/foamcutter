@@ -394,7 +394,7 @@ def _cut_speed(feeds: list[Motion], d_root: Arr, d_tip: Arr, job: Job, exits: li
 def _block_box(job: Job, targets: dict[str, SectionTarget]) -> tuple[float, ...]:
     b = job.block
     ys = [t.y for t in targets.values()]
-    return (min(ys), max(ys), b.x, b.x + b.length, 0.0, b.height)
+    return (min(ys), max(ys), b.x, b.x + b.length, b.z, b.z + b.height)
 
 
 def _start_end(

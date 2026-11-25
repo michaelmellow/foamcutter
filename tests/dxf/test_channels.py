@@ -288,3 +288,37 @@ def test_preview_path_follows_rapid_channel_exits(dxfs: tuple[Path, Path], tmp_p
     for a in inner:
         assert any(math.dist(a, (*p, *q)) < 1e-9 for p, q in path)
     assert all(b >= a for a, b in zip(geometry.times, geometry.times[1:]))
+
+
+def test_tip_channel_meets_the_same_place_as_the_root(dxfs: tuple[Path, Path], profile: Profile) -> None:
+    """A shallow channel at the same angle meets the two (different) sections far apart;
+    the tip channel turns a little so both meet the same fraction of the way along the side."""
+    from foamdxf.holes import _slit_place, drawn_paths
+
+    root_outer, tip_outer = tuple(naca(180)), tuple(naca(130, 20))
+    root_hole = min(read_outline(dxfs[0]).holes, key=lambda h: math.dist(h[0], (110, 3)))
+    tip_hole = min(read_outline(dxfs[1]).holes, key=lambda h: math.dist(h[0], (100, 3)))
+    spec = ChannelSpec("straight", angle=345.0, offset=0.0)
+    rc, tc = drawn_paths("hole2", spec, root_outer, root_hole, tip_outer, tip_hole, 1.0)
+    plain = channel_path(spec, tip_outer, tip_hole)  # the tip at the spec's own angle
+    target = _slit_place(rc, root_outer, None)
+    assert abs(_slit_place(plain, tip_outer, None) - target) > 0.02  # far apart without matching
+    assert _slit_place(tc, tip_outer, None) == pytest.approx(target, abs=1e-4)
+    assert rc.slit == tc.slit == "lower"
+    parsed = build_job(read_outline(dxfs[0]), read_outline(dxfs[1]), profile,
+                       Placement(span=300, stock_length=220, stock_height=40),
+                       CutSettings(channels={"hole2": spec}))
+    assert generate(load_job_text(parsed.text, Path(".")), profile).total_time > 0
+
+
+def test_grazing_channel_is_reported() -> None:
+    """A line that leaves the foam only through a shallow dent in the skin, and comes straight
+    back in, cannot end clear of the outline."""
+    outer = ((100.0, 10.0), (0.0, 10.0), (0.0, -10.0), (58.0, -10.0), (60.0, -9.7), (62.0, -10.0), (100.0, -10.0))
+    hole = tuple((30 + math.cos(k * math.pi / 16), -8.5 + math.sin(k * math.pi / 16)) for k in range(32))
+    angle = math.degrees(math.atan2(-9.8 - -8.5, 60 - 30))  # through the dent, 0.1 mm under its top
+    with pytest.raises(DxfError, match="only grazes the outer contour.*turn it more steeply"):
+        channel_path(ChannelSpec("straight", angle, 0.0), outer, hole)
+    # straight down leaves cleanly, its last point at least 0.5 mm outside
+    path = channel_path(ChannelSpec("straight", 270.0, 0.0), outer, hole)
+    assert path.points[-1][1] <= -10.5

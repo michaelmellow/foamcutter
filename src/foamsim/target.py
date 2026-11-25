@@ -257,7 +257,7 @@ def build_targets(job: Job, profile: Profile) -> dict[str, SectionTarget]:
         x, z = outer[:, 0], outer[:, 1]
         outside = max(
             float(np.max(b.x - x)), float(np.max(x - (b.x + b.length))),
-            float(np.max(-z)), float(np.max(z - b.height)), 0.0,
+            float(np.max(b.z - z)), float(np.max(z - (b.z + b.height))), 0.0,
         )
         if outside > 0:
             errors.append(

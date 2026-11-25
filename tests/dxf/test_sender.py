@@ -947,3 +947,57 @@ def test_kerf_tab_runs_the_slots_and_saves_a_table(window, tmp_path, monkeypatch
     assert (tmp_path / "machine.yaml.bak").is_file()
     assert window.vars["kerf_table"].get() == "eps-test"
     assert m.disconnect()
+
+
+def test_cut_tab_goes_to_the_start_then_cuts_across(window, tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Machine tab, Cut tab: cold to the operator side at the height, then hot across (crosscut.py)."""
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[2]
+    window.vars["profile"].set(str(repo / "examples/profiles/real-machine.yaml"))
+    m, c = window.machine, window.cross_cut
+    assert m.controls.tab(str(c), "text") == "Cut"
+    c.height.set("35")
+    c.speed.set("200")
+    assert "Z=X=0 (operator side) to 300 at A=Y=35, 200 mm/min: 1.5 min" in c.note.get()
+    c.height.set("400")
+    assert "outside the vertical travel 0 to 280" in c.note.get()
+    c.height.set("35")
+
+    fake = FakeGrbl(rx=1024, track={"X": 120.0, "Y": 60.0, "Z": 120.0, "A": 60.0})
+
+    def connect(device: str) -> Sender:
+        s = Sender(fake, device)
+        s.start()
+        return s
+
+    m._connect = connect
+    m._ports = lambda: [("FAKE1", "fake grblHAL")]
+    m.refresh_ports()
+    m.connect()
+    pump(window, lambda: m.can_move())
+    asked: list[str] = []
+    warned: list[str] = []
+
+    def confirm(title: str, *_a: object, **_k: object) -> bool:
+        asked.append(title)
+        return True
+
+    monkeypatch.setattr("tkinter.messagebox.askokcancel", confirm)
+    monkeypatch.setattr("tkinter.messagebox.showwarning", lambda title, *a, **k: warned.append(title))
+
+    c.cut()  # not at the start yet: refused
+    assert warned == ["Not at the start"] and asked == []
+
+    c.go_to_start()
+    pump(window, lambda: m.progress_note.get().startswith("Finished: cross cut: wire to the start"))
+    assert fake.lines[-2:] == ["G0 Z0.000 X0.000", "G0 A35.000 Y35.000"]  # across first, then down
+    pump(window, lambda: m.work_position() == {"X": 0.0, "Y": 35.0, "Z": 0.0, "A": 35.0})
+
+    c.cut()
+    pump(window, lambda: m.progress_note.get().startswith("Finished: cross cut at z 35"))
+    assert asked == ["Wire to the cut start", "Cut across"]
+    assert fake.lines[-1] == "G1 Z300.000 X300.000 A35.000 Y35.000 F200"
+    assert "Switch the wire heat off" in m.progress_note.get()
+    assert m.settings["cross_z"] == "35" and m.settings["cross_speed"] == "200"
+    assert m.disconnect()

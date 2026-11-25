@@ -124,3 +124,16 @@ def test_channels_leading_into_each_other_are_rejected() -> None:
     data = job(channel=[[60.0, -3.0], [75.0, -8.0]], other_channel=INTO_SPAR)
     with pytest.raises(InputError, match="never leads to the outer contour"):
         sim("G0 X0 Y0 Z0 A0" + chr(10), data)
+
+
+def test_raised_block_is_simulated() -> None:
+    """job-file.md §5 block.z: the block may sit above the table (here on another one)."""
+    from foamsim import InputError
+
+    data = job(block={"x": 90.0, "length": 120.0, "height": 40.0, "z": 30.0})
+    assert parse_job(copy.deepcopy(data), Path(".")).block.z == 30.0
+    result = sim(cam(data), data)
+    assert result.passed, result.summary()
+    low = job(block={"x": 90.0, "length": 120.0, "height": 40.0, "z": 45.0})  # part reaches z = 40
+    with pytest.raises(InputError, match="lies outside the block"):
+        sim("G0 X0 Y0 Z0 A0\n", low)
