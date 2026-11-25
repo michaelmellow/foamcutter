@@ -19,6 +19,7 @@ def report(
     kerf_used: dict[str, list[float]],
     stretches: list[tuple[str, float, float]],
     kerf_rounds: dict[str, int],
+    unmatched_corners: list[str] | None = None,
 ) -> str:
     from .cam import speed_ratio
 
@@ -75,6 +76,9 @@ def report(
             lines.append(f"Kerf at {face}:  {min(used):.3f} to {max(used):.3f} mm (half applied each side)")
     lines.append("Kerf per stretch of the outer contour (root / tip, mm):")
     lines += [f"  {name}: {k_r:.3f} / {k_t:.3f}" for name, k_r, k_t in stretches]
+    matched = sum(name.startswith("corner") for name, _, _ in stretches)
+    lines.append(f"Matched corners of the outer contour: {matched}")
+    lines += [f"  warning: {note}" for note in unmatched_corners or []]
     lines.append("Kerf lookups from the compensated path: " + ", ".join(f"{w} {n}" for w, n in kerf_rounds.items()))
     faster = sum(max(m.root_length, m.tip_length) for m in feed)
     minutes = result.total_time

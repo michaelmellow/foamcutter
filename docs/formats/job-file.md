@@ -378,9 +378,23 @@ The start point is called `S`.
 
 These points are matched one to one between root and tip: `S`, the leading
 edge, the far trailing-edge point, the slit points, every vertex of every
-feature (with the slit points of channels into another hole inserted, §8), and
-every channel point except the last. The slit points are inserted into the outer contour of §6.3 as extra
-vertices. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
+feature (with the slit points of channels into another hole inserted, §8),
+every channel point except the last, and the matched corners below. The slit points are inserted into the outer contour of §6.3 as extra
+vertices.
+
+**Matched corners.** A **corner** is a vertex of the outer contour (after
+§6.2 and §6.3) where the contour turns by more than 60 degrees: the angle
+between the direction of the edge into the vertex and the edge out of it,
+skipping edges of zero length. The points named above, other than corners,
+divide each section's outer contour into **base stretches**, as stretches
+are defined below. For each base stretch, count the corners strictly inside
+it at the root and at the tip. If the two counts are equal, the *j*-th corner
+at the root (in the traversal direction, §10.1) is matched with the *j*-th
+corner at the tip, and all of them are fixed points. If the counts differ,
+none of that base stretch's corners is a fixed point, and the CAM report
+names the base stretch and both counts. Corners make a notch, a step or a
+spar cap slot in the outer contour reach the wire at root and tip at the
+same moment. Kerf compensation (§10.7) and synchronisation (§10.3) then work on
 the placed contours of §6.5, in each section plane. Twist and placement are a
 rotation and a translation, so lengths and angles are the same in both frames.
 

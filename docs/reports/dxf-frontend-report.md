@@ -965,3 +965,57 @@ linked to plain tip surface 21 to 23 mm away.
 NOT verified: by the owner in the GUI. The 30 degree corner threshold is a
 guess: a tight leading edge cut in short moves could split into extra
 sections (harmless, only more colours).
+
+## 20. Matched corners of the outer contour (format change, branch `sync-check`)
+
+Approved by the owner after the Sync check (§19) showed the notches of
+ElectronicsPlanetest.STEP out of sync.
+
+Format (docs/formats/job-file.md §10.2, new paragraph "Matched corners"): a
+**corner** is a vertex of the outer contour where it turns by more than 60
+degrees. Between the existing fixed points (start, leading edge, far trailing
+edge, slit points), if root and tip have the same number of corners, the
+j-th root corner is matched with the j-th tip corner and they become fixed
+points: each starts a new stretch with its own kerf (§10.7 unchanged). If
+the counts differ, nothing is matched there and the report says so.
+
+Built (src/foamcam/cam.py): `corners`, `matched_fixed_points`,
+`CORNER_ANGLE = 60.0`; the report gets "Matched corners of the outer contour:
+N" and a warning line per stretch whose counts differ.
+
+Why 60 and not 30 degrees: the example Selig airfoils (61 points) turn 37.5
+degrees at the point after the leading edge. At 30 degrees that point was
+"matched" (harmlessly, the same airfoil at both faces) and changed the
+committed tapered-spar G-code. Notches, steps and spar-cap slots turn about
+90 degrees. At 60 the three example jobs cut exactly as before.
+
+Verified:
+- tests/cam/test_corners.py: only sharp turns are corners; notch corners at
+  different chord positions are matched in order; in the program each root
+  notch corner is on one line with the tip notch corner; a tip without the
+  notch falls back with the report warning; the tapered rectangle's lower LE
+  corner is one line, not two. The last two fail with matching switched off.
+- tests/cam/test_acceptance.py, the hand-calculated tapered rectangle: its
+  lower LE corner P2 was hand-calculated for the old rule (two lines, root
+  and tip each reaching the corner at a different fraction). Recalculated by
+  hand for the new rule: one line, G1 (49.9, 9.9, 199.9, 69.9). The
+  docstring keeps the old numbers as a note.
+- The wing: 8 matched corners, root and tip go through each notch on the
+  same lines (path points 83-94 and 535-547 at both faces); the Sync check
+  shows the notch walls in the same colours at both faces.
+- check.py cam and dxf pass; check.py sim has the same 19 failures as
+  before this change.
+
+Consequence for this wing (open question for the owner): with the corners
+matched, the root face has to go slower where its notch is shallower and
+where it is closer to the trailing edge. At 250 mm/min the root face moves at
+147 mm/min from the trailing edge to the first notch corner (43.7 mm at the
+root against 74.4 mm at the tip), below the 167 mm/min bottom of the kerf
+table "measured-2026-11-15hs", and the CAM refuses (with that explanation).
+The deepest difference is the lower notch wall, 1.5 mm at the root against
+3.7 mm at the tip, which needs at least about 415 mm/min at the faster face.
+At 450 mm/min the wing generates (speed ratio max 2.40, limit 3). Either a
+higher cut speed or a kerf table measured down to about 100 mm/min.
+
+NOT verified: on the machine. Rounded corners drawn as several short edges,
+each turning less than 60 degrees, are not corners; they cut as before.

@@ -28,6 +28,8 @@ KERF_SETTLED = 0.001
 EXACT_JOIN_ANGLE = 20.0
 # §10.3: two breakpoints closer than this (mm) at both faces are merged.
 MERGE_GAP = 0.001
+# §10.2: the outer contour turns by more than this (degrees) at a corner.
+CORNER_ANGLE = 60.0
 
 
 @dataclass
@@ -116,6 +118,43 @@ def fixed_points(outline: Outline, direction: str) -> tuple[list[int], list[str]
     return [m[0] for m in marks], [m[2] for m in marks]
 
 
+def corners(outline: Outline, direction: str) -> list[int]:
+    """§10.2: positions in the traversal of the corners of the outer contour."""
+    loop = traversal(outline, direction)[:-1]
+    polygon = [outline.contour[i] for i in loop]
+    return [p for p in range(len(polygon)) if g.turn_angle(polygon, p) > CORNER_ANGLE]
+
+
+def matched_fixed_points(
+    root: Outline, tip: Outline, direction: str
+) -> tuple[list[int], list[int], list[str], list[str]]:
+    """§10.2: the fixed points of both faces with the matched corners added: positions in
+    the root and the tip traversal, their labels, and a note for every base stretch whose
+    corners could not be matched (the counts differ)."""
+    base_r, base_labels = fixed_points(root, direction)
+    base_t, _ = fixed_points(tip, direction)
+    corners_r, corners_t = corners(root, direction), corners(tip, direction)
+    pos_r, pos_t, labels = [base_r[0]], [base_t[0]], [base_labels[0]]
+    unmatched: list[str] = []
+    number = 0
+    for k in range(1, len(base_r)):
+        inside_r = [p for p in corners_r if base_r[k - 1] < p < base_r[k]]
+        inside_t = [p for p in corners_t if base_t[k - 1] < p < base_t[k]]
+        if len(inside_r) == len(inside_t):
+            for a, b in zip(inside_r, inside_t):
+                number += 1
+                pos_r.append(a)
+                pos_t.append(b)
+                labels.append(f"corner {number}")
+        else:
+            unmatched.append(f"{base_labels[k - 1]} to {base_labels[k]}: {len(inside_r)} corners at the root, "
+                             f"{len(inside_t)} at the tip, not matched")
+        pos_r.append(base_r[k])
+        pos_t.append(base_t[k])
+        labels.append(base_labels[k])
+    return pos_r, pos_t, labels, unmatched
+
+
 class Cam:
     def __init__(self, job: Job, profile: Profile, root: Outline, tip: Outline) -> None:
         self.job = job
@@ -126,6 +165,7 @@ class Cam:
         self.kerf_used: dict[str, list[float]] = {"root": [], "tip": []}
         self.kerf_rounds: dict[str, int] = {}
         self.stretches: list[tuple[str, float, float]] = []  # (from to, root kerf, tip kerf)
+        self.unmatched_corners: list[str] = []  # §10.2: base stretches whose corner counts differ
         self.problems: list[str] = []
         self.slow_parts: dict[str, str] = {}  # out-of-table lookup message -> the part of the cut that is slow
 
@@ -163,8 +203,7 @@ class Cam:
         job = self.job
         loop_r = traversal(self.root, job.direction)
         loop_t = traversal(self.tip, job.direction)
-        pos_r, labels = fixed_points(self.root, job.direction)
-        pos_t, _ = fixed_points(self.tip, job.direction)
+        pos_r, pos_t, labels, self.unmatched_corners = matched_fixed_points(self.root, self.tip, job.direction)
         poly_r, pos_r = transition_vertices(
             [self.root.place(self.root.contour[i]) for i in loop_r[:-1]], pos_r, job.max_segment_length
         )
@@ -396,7 +435,8 @@ class Cam:
         from .output import preview_svg, report
 
         result.gcode = "\n".join(lines.text) + "\n"
-        result.report = report(job, self.profile, result, self.kerf_used, self.stretches, self.kerf_rounds)
+        result.report = report(job, self.profile, result, self.kerf_used, self.stretches, self.kerf_rounds,
+                               self.unmatched_corners)
         result.preview_svg = preview_svg(job, self.profile, self.root, self.tip, comp_r, comp_t, refs)
         return result
 
