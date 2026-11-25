@@ -183,7 +183,7 @@ def test_form_block_z_is_optional() -> None:
 
 def test_stock_tab_and_3d_view_are_in_the_machine_tab(window: SlicerWindow, tmp_path: Path) -> None:
     tab_names = [window.tabs.tab(t, "text") for t in window.tabs.tabs()]  # type: ignore[no-untyped-call]
-    assert tab_names == ["Machine", "Report"]  # no separate 3D or Align stock tab
+    assert tab_names == ["Machine", "Sync check", "Report"]  # no separate 3D or Align stock tab
     m = window.machine
     assert str(window.stock_pane) in m.controls.tabs()  # type: ignore[no-untyped-call] # beside Program, Jog, Home, Kerf
     panes = window.machine_tab.panes()  # type: ignore[no-untyped-call]

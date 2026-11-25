@@ -918,3 +918,50 @@ NOT verified: on an actual 200 % monitor. Sizes given in pixels (the
 window's opening size, note wrap widths, the 3D view's compact height) do not
 follow the UI size. The window is not made DPI aware, so Windows still
 stretches it at high scaling and text stays slightly soft.
+
+## 19. Sync check tab (owner's request, branch `sync-check`)
+
+Owner's report: on ElectronicsPlanetest.STEP (a swept, tapered wing with a
+notch in the upper and the lower surface at both faces) the notches "did not
+meet up in the middle" of the span.
+
+Diagnosis: the CAM pairs root and tip points only at the fixed pairs of
+job-file.md §10.2 (start, leading edge, far trailing edge, features and
+slits); between them it moves both faces in proportion to arc length (§10.3).
+Corners of the outer contour are not fixed pairs. On this wing the root notch
+is cut at path points 70-78 and the tip notch at 84-95 (upper side), and the
+other way round on the lower side (root 554-563, tip 537-549), so the wire
+cuts a slanted groove that has the right shape only near the two faces. This
+follows the format as written; fixing it needs a format change, which is the
+next, separate step.
+
+Built (src/foamdxf/syncview.py, a "Sync check" tab between Machine and Report):
+
+- Both wire paths at the foam faces (kerf compensated) in a column: root
+  above, tip below, same scale and the same x (so the sweep shows), root
+  thick and tip thin, with the drawn outlines in grey. "Overlay" draws them
+  on top of each other instead.
+- The outline cut is split into **sections** at every corner (a turn of more
+  than 30 degrees between two moves) of either path. A section is a run of
+  moves, so its root and tip halves are cut at the same time; both get the
+  same colour (9-colour cycle). Matching features in different colours are
+  out of sync.
+- "Links" (on by default): a dashed line for the wire at every section start,
+  so in-sync corners are joined to their counterparts.
+- A click selects a section: both halves are outlined and two dashed lines
+  show the wire at its start and end. The top bar gives both lengths and how
+  far apart the two ends of the wire are at the section's start and end.
+  The arrow keys step through the sections; wheel zoom, right-drag pan,
+  double-click or Fit view to fit.
+
+Verified: tests/dxf/test_syncview.py (corner angle; one section per side of
+a synced square, twice as many when the tip is 2 moves late; every cutting
+move of a real cut in exactly one run; colours; click and arrow selection;
+the tab fills on Preview). test_gui's list of top-level tabs now includes
+"Sync check". Screenshot of the wing: the root notch walls and the tip
+notch walls have different colours, and the selected root notch wall is
+linked to plain tip surface 21 to 23 mm away.
+
+NOT verified: by the owner in the GUI. The 30 degree corner threshold is a
+guess: a tight leading edge cut in short moves could split into extra
+sections (harmless, only more colours).

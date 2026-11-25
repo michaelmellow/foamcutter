@@ -75,6 +75,7 @@ from .project import open_project as read_project
 from .project import save_project as write_project
 from .sender import Status
 from .step import StepModel, read_step, sections
+from .syncview import SyncView
 from .uiscale import (
     UI_SIZE_KEY,
     UI_SIZES,
@@ -418,6 +419,7 @@ class SlicerWindow:
         self.plan = self.result = self.geometry = None
         self.draw()
         self.view3d.show(None)
+        self.sync_view.show(None)
         self._update_alignment()
         self._update_readout(0)
         self.wire_label.set("")
@@ -831,6 +833,9 @@ class SlicerWindow:
         self.report.pack(fill=tk.BOTH, expand=True)
         tabs.add(report_frame, text="Report")
         self.report_frame = report_frame
+        # which part of the root path is cut together with which part of the tip path
+        self.sync_view = SyncView(tabs)
+        tabs.insert(report_frame, self.sync_view, text="Sync check")
         self.frame3d = frame3d
         self.tabs = tabs
         self.canvas.bind("<Configure>", lambda _e: self.draw())
@@ -1180,6 +1185,7 @@ class SlicerWindow:
             self.tabs.select(self.report_frame)  # type: ignore[no-untyped-call]
             self.draw()
             self.view3d.show(None)
+            self.sync_view.show(None)
             self._update_alignment()
             self.wire_label.set("")
             self._update_readout(0)
@@ -1194,6 +1200,7 @@ class SlicerWindow:
             self.tabs.select(self.machine_tab)  # type: ignore[no-untyped-call]
         self.draw()
         self.view3d.show(self.geometry)
+        self.sync_view.show(self.geometry)
         self._update_alignment()
         self.scrubber.configure(to=len(self.geometry.tower_12) - 1)
         self.wire_pos.set(0)
